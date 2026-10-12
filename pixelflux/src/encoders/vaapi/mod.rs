@@ -55,8 +55,8 @@ use super::codec::{
 };
 use super::frame_rate::FrameRate;
 use super::reference::{
-    Invalidation, REFERENCE_FRAMES, Reference, ReferenceReport, ReferenceSlots, ReferenceWindow,
-    SlotPlan,
+    ANCHORS, Invalidation, REFERENCE_FRAMES, Reference, ReferenceReport, ReferenceSlots,
+    ReferenceWindow, SlotPlan,
 };
 use super::session::{RateSettings, check_host_frame};
 use super::sps::{NoReorder, h264_frame_num_range};
@@ -408,10 +408,12 @@ impl Device {
         self.vce || (self.whole_picture_vdenc && entrypoint == VAEntrypointEncSliceLP)
     }
 
-    /// Whether an H.264 session keeps a long-term anchor (`ReferenceWindow::with_anchors`): the
-    /// driver codes a picture from the reference it is named, as radeonsi's VCE was measured to
-    /// (`vaapi_predicts_past_a_lost_frame`, `vaapi_predicts_from_an_anchor`); others are not yet.
-    fn keeps_h264_anchors(&self) -> bool {
+    /// Whether a session keeps anchors (`ReferenceWindow::with_anchors`): the driver codes a
+    /// picture from the reference it is named, as radeonsi's VCE (H.264) and UVD (H.265) were
+    /// measured to (`vaapi_predicts_past_a_lost_frame`, `vaapi_predicts_from_an_anchor`); others
+    /// are not yet. H.264 keeps one, long-term; H.265 keeps two, listed as short-term pictures in
+    /// every reference picture set, as NVENC's are.
+    fn keeps_anchors(&self) -> bool {
         self.vendor.contains("radeonsi")
     }
 
@@ -1320,8 +1322,15 @@ impl VaapiEncoder {
         me.arm = arm;
         me.references = me.arm.tracks_references(packed).then(|| match me.arm {
             Arm::Vp8(_) => References::Slots(ReferenceSlots::new()),
-            Arm::H264(_) if me.device.keeps_h264_anchors() && dpb >= 3 => {
+            Arm::H264(_) if me.device.keeps_anchors() && dpb >= 3 => {
                 let mut w = ReferenceWindow::with_anchors(dpb, 1);
+                if settings.acknowledge_references {
+                    w.set_acknowledged();
+                }
+                References::Window(w)
+            }
+            Arm::H265(_) if me.device.keeps_anchors() && dpb as usize >= ANCHORS + 2 => {
+                let mut w = ReferenceWindow::with_anchors(dpb, ANCHORS);
                 if settings.acknowledge_references {
                     w.set_acknowledged();
                 }
@@ -2938,23 +2947,27 @@ mod tests {
         }
     }
 
-    /// On a VA-API device that keeps an H.264 anchor (`keeps_h264_anchors`): a loss older than
-    /// the recent frames, twelve frames deep after the anchors at 48 and 96, is predicted past
-    /// from the long-term anchor, and one four frames deep covering the anchor at 48 from the
-    /// recent frame before it, the lost anchor still listed long-term while the decoder holds it;
+    /// On a VA-API device that keeps anchors (`keeps_anchors`): a loss older than the recent
+    /// frames, twelve frames deep after the anchors at 48 and 96 (H.264; H.265 marks one every
+    /// twelve), is predicted past from an anchor, and an H.264 one four frames deep covering the
+    /// anchor at 48 from the recent frame before it, the lost anchor listed long-term while held;
     /// either way the decoder that never saw the lost frames shows every later picture as one
     /// that saw them all does. (Deeper, a gap FFmpeg fills would push that frame out of a
     /// browser's decoder, and the window codes a key frame: `forget_stale`.)
     #[test]
     #[ignore]
     fn vaapi_predicts_from_an_anchor() {
-        for (from, every, depth, want) in [(70, 40, 12, 2), (52, 1000, 4, 0)] {
+        for (codec, from, every, depth, want) in [
+            (Codec::H264, 70, 40, 12, 2),
+            (Codec::H264, 52, 1000, 4, 0),
+            (Codec::H265, 70, 40, 12, 2),
+        ] {
             if let Some((past, anchored, keys, apart, worst)) =
-                predict_past_losses(Codec::H264, from, every, depth)
+                predict_past_losses(codec, from, every, depth)
             {
                 assert!(
                     past >= 1 && anchored == want.min(past),
-                    "{anchored} of {past} from an anchor"
+                    "{codec:?}: {anchored} of {past} from an anchor"
                 );
                 assert_eq!(keys, 0);
                 assert!(

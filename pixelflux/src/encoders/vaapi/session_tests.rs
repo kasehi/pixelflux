@@ -729,6 +729,83 @@ fn h264_keeps_a_long_term_anchor_where_the_driver_takes_one() {
     });
 }
 
+/// On radeonsi an H.265 session keeps two anchors as short-term pictures: a frame predicting
+/// past a loss older than the recent frames names the newest anchor before it in `RefPicList0`,
+/// and every picture lists the anchors in its reference frames (the slice header's reference
+/// picture set). Elsewhere the session keeps the recent frames alone, and such a loss is a key
+/// frame.
+#[test]
+fn h265_keeps_two_anchors_where_the_driver_takes_them() {
+    for (vendor, anchored) in [
+        (
+            Some(c"Mesa Gallium driver for AMD Radeon Pro VII (radeonsi, vega20)"),
+            true,
+        ),
+        (None, false),
+    ] {
+        let mut driver = Driver::generous();
+        driver.vendor = vendor;
+        mock::reset(driver);
+        let mut enc = session(Codec::H265, false);
+        for t in 0..=60u64 {
+            encode(&mut enc, t, t == 0);
+        }
+        let listed = || {
+            mock::with(|d| {
+                let pic: VAEncPictureParameterBufferHEVC =
+                    d.last_param(VAEncPictureParameterBufferType).unwrap();
+                let mut pocs: Vec<i32> = pic
+                    .reference_frames
+                    .iter()
+                    .filter(|r| r.picture_id != VA_INVALID_ID)
+                    .map(|r| r.pic_order_cnt)
+                    .collect();
+                pocs.sort_unstable();
+                pocs
+            })
+        };
+        assert_eq!(
+            listed().contains(&48),
+            anchored,
+            "{vendor:?}: 48, an anchor, listed at 60: {:?}",
+            listed()
+        );
+        enc.invalidate_reference(50);
+        let out = encode(&mut enc, 61, false);
+        let (_, kind) = parse_video_type(out[1]).unwrap();
+        assert_eq!(
+            kind == FRAME_KEY,
+            !anchored,
+            "{vendor:?}: a loss older than the recent frames"
+        );
+        if !anchored {
+            continue;
+        }
+        assert_eq!(
+            enc.last_reference(),
+            Reference::Frame(48),
+            "predicted past from the newest anchor before the loss"
+        );
+        mock::with(|d| {
+            let slices = d.last_buffers(VAEncSliceParameterBufferType);
+            let slice: VAEncSliceParameterBufferHEVC =
+                unsafe { ptr::read_unaligned(slices[0].as_ptr() as *const _) };
+            assert_eq!(
+                (
+                    slice.ref_pic_list0[0].pic_order_cnt,
+                    slice.ref_pic_list0[0].flags
+                ),
+                (48, VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE)
+            );
+        });
+        let pocs = listed();
+        assert!(
+            pocs.contains(&48) && !pocs.iter().any(|&p| (50..=60).contains(&p)),
+            "the anchor kept, the lost frames and those after them left out: {pocs:?}"
+        );
+    }
+}
+
 /// A session told to keep one reference frame (`video_reference_frames`) declares a decoded
 /// picture buffer of one in H.264 and H.265, and keeps no anchor even where the driver takes one.
 #[test]
