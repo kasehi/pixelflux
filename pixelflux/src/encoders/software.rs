@@ -1942,7 +1942,7 @@ pub fn encode_cpu(
                         stripe_height: actual_height as i32,
                         frame_id: frame_counter as i32,
                         timing: FrameTiming::default(),
-                        reference: Reference::Untracked,
+                        reference: enc.last_reference(),
                     }),
                     Ok(_) => None,
                     Err(e) => {
@@ -2002,16 +2002,27 @@ pub fn invalidate_reference(stripes: &mut [StripeState], frame_id: u16) -> bool 
             }
             forgotten
         } else {
-            // OpenH264's long-term references are the only lever here, and they cannot be
-            // steered from the encoder side: the recovery request does code a delta instead
-            // of a key frame, but it predicts from whichever long-term reference the encoder
-            // marked, and the frame number of that marking reaches the application only
-            // through OpenH264's own decoder. A browser never reports it, so the delta would
-            // name a frame the client may not hold.
-            let _ = (stripes, frame_id);
-            false
+            // OpenH264 predicts past a loss only from a long-term reference every consumer
+            // holds, which only a full-frame instance keeps; a stripe of several codes a key
+            // frame.
+            let mut forgotten = true;
+            for enc in stripes.iter_mut().filter_map(|s| s.h264_encoder.as_mut()) {
+                forgotten &= enc.invalidate_reference(frame_id);
+            }
+            forgotten
         }
     }
+}
+
+/// Every consumer holds frame `frame_id`, or where not `held` was sent it: OpenH264 confirms the
+/// long-term reference it marked there. x264 keeps none.
+pub fn acknowledge_reference(stripes: &mut [StripeState], frame_id: u16, held: bool) {
+    #[cfg(not(feature = "gpl"))]
+    for enc in stripes.iter_mut().filter_map(|s| s.h264_encoder.as_mut()) {
+        enc.acknowledge_reference(frame_id, held);
+    }
+    #[cfg(feature = "gpl")]
+    let _ = (stripes, frame_id, held);
 }
 
 /// Most stripes a frame is cut into, whatever the encoder host's core count.

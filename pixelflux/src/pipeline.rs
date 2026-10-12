@@ -12,7 +12,8 @@
 
 use crate::RustCaptureSettings;
 use crate::encoders::software::{
-    EncodedStripe, StripeState, encode_cpu, invalidate_reference, stripes_held_still,
+    EncodedStripe, StripeState, acknowledge_reference, encode_cpu, invalidate_reference,
+    stripes_held_still,
 };
 use crate::encoders::{self, Codec, FrameEncoder, FrameSource};
 use smithay::utils::{Physical, Rectangle};
@@ -1264,7 +1265,14 @@ impl X11Pipeline {
             (None, ReferenceReport::Lost(frame_id)) => {
                 invalidate_reference(&mut self.stripes, frame_id)
             }
-            (None, _) => true,
+            (None, ReferenceReport::Held(frame_id)) => {
+                acknowledge_reference(&mut self.stripes, frame_id, true);
+                true
+            }
+            (None, ReferenceReport::Sent(frame_id)) => {
+                acknowledge_reference(&mut self.stripes, frame_id, false);
+                true
+            }
         };
         if !taken {
             self.pending_force_idr = true;

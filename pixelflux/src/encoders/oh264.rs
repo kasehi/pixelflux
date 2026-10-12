@@ -21,8 +21,9 @@
 use crate::RustCaptureSettings;
 use crate::encoders::QP_HYSTERESIS_LIMIT;
 use crate::encoders::codec::{
-    Codec, FRAME_DELTA, FRAME_INTRA, FRAME_KEY, VIDEO_HEADER_LEN, push_video_header,
+    Codec, FRAME_ANCHOR, FRAME_DELTA, FRAME_INTRA, FRAME_KEY, VIDEO_HEADER_LEN, push_video_header,
 };
+use crate::encoders::oh264_refs::{LongTermRefs, Recovery};
 use crate::encoders::reference::Reference;
 use openh264::OpenH264API;
 use openh264::encoder::{
@@ -30,6 +31,13 @@ use openh264::encoder::{
     RateControlMode, UsageType, VuiConfig,
 };
 use openh264::formats::YUVSlices;
+
+/// The frames OpenH264 lets pass between its long-term markings. Each marking waits on the
+/// confirmation of the one before, and a loss is predicted past from the newest confirmed, so a
+/// short period keeps that one near: with a slow page dark 2 s in every 10, the frames predicting
+/// past its losses over WebSockets reached 10 frames back (median) at 2, against 50 at
+/// OpenH264's default of 30.
+const LTR_MARK_PERIOD: u32 = 2;
 
 /// Suppresses OpenH264's built-in periodic IDR so the GOP is effectively infinite and a
 /// keyframe costs bitrate only when something genuinely needs one.
@@ -88,6 +96,9 @@ pub struct Openh264Encoder {
     qp_hysteresis_counter: u32,
     is_cbr: bool,
     omit_stripe_headers: bool,
+    /// A full-frame instance's long-term references, read off its own output.
+    refs: Option<LongTermRefs>,
+    last_reference: Reference,
 }
 
 impl Openh264Encoder {
@@ -125,7 +136,8 @@ impl Openh264Encoder {
     ///    substitute its screen-content defaults `[26, 35]`; explicit non-zero values are honored
     ///    (the library clips the min up to its own floor of 12).
     ///
-    /// 3. **Base config** (shared by both rate modes): screen-content real-time usage, low
+    /// 3. **Base config** (shared by both rate modes): screen-content real-time usage for a stripe
+    ///    of several, camera usage with long-term references for a full-frame instance (`refs`), low
     ///    complexity, an effectively infinite intra period, a VUI declaring the conversion
     ///    (BT.709 primaries, transfer, and matrix at limited range; without it a WebRTC receiver
     ///    infers the range from the SDP profile and can display the picture visibly darker), and
@@ -134,10 +146,10 @@ impl Openh264Encoder {
     ///    and the next P-frame references the last *encoded* frame, so the reference chain stays
     ///    intact. Adaptive quantization and background detection are set explicitly to `false` to
     ///    silence the init warnings (both are auto-disabled for screen content anyway). Scene-change
-    ///    detection stays on: `ParamValidation` force-enables it for screen-content usage, so its
-    ///    content-adaptive IDRs are inherent to this encoder and the wire header labels them
-    ///    correctly. The internal stderr trace follows the capture's `debug_logging` flag
-    ///    (otherwise quiet).
+    ///    detection stays on for screen content, where `ParamValidation` force-enables it, so its
+    ///    content-adaptive IDRs are inherent there and the wire header labels them correctly; the
+    ///    camera usage turns it off. The internal stderr trace follows the capture's
+    ///    `debug_logging` flag (otherwise quiet).
     ///
     /// 4. **Rate control**:
     ///    - **CBR** (`video_cbr_mode`): bitrate-mode RC targeting `bitrate_kbps`, with the QP range
@@ -170,7 +182,7 @@ impl Openh264Encoder {
             (1, 1)
         };
 
-        let encoder = Self::build_encoder(settings, fps, bps, crf as u8, threads)?;
+        let encoder = Self::build_encoder(settings, fps, bps, crf as u8, threads, fullframe)?;
 
         let (cw, ch) = (width / 2, height / 2);
         let mut me = Self {
@@ -190,6 +202,8 @@ impl Openh264Encoder {
             qp_hysteresis_counter: 0,
             is_cbr: settings.video_cbr_mode,
             omit_stripe_headers: settings.omit_stripe_headers,
+            refs: fullframe.then(LongTermRefs::new),
+            last_reference: Reference::Untracked,
         };
         me.enable_slices();
         Some(me)
@@ -230,24 +244,35 @@ impl Openh264Encoder {
     /// CRF/CQP quantizer, and that rebuild has to reproduce the session's configuration exactly
     /// apart from the QP — hence the live `fps` / `bitrate_bps` / `crf` arguments rather than
     /// reading the construction settings for values a running session can have retuned.
+    ///
+    /// With `long_term` the camera usage: OpenH264 predicts past a loss from a long-term reference
+    /// only there (its screen-content strategy with long-term references ignores the recovery
+    /// request), and it codes a scrolling document as well (41.4 against 41.3 dB moving, 57.1 both
+    /// still, 1080p at 8 Mbit/s).
     fn build_encoder(
         settings: &RustCaptureSettings,
         fps: f32,
         bitrate_bps: u32,
         crf: u8,
         threads: u16,
+        long_term: bool,
     ) -> Option<Encoder> {
+        let usage = if long_term {
+            UsageType::CameraVideoRealTime
+        } else {
+            UsageType::ScreenContentRealTime
+        };
         let base = EncoderConfig::new()
             .max_frame_rate(FrameRate::from_hz(fps))
-            .usage_type(UsageType::ScreenContentRealTime)
+            .usage_type(usage)
+            .long_term_reference(long_term)
+            .scene_change_detect(!long_term)
             .complexity(Complexity::Low)
             .skip_frames(true)
             .adaptive_quantization(false)
             .background_detection(false)
-            // Scene-change detection stays on: OpenH264 forces it back on under
-            // ScreenContentRealTime and warns when asked for anything else, so the
-            // infinite-GOP contract cannot be tightened from here the way x264's
-            // `i_scenecut_threshold = 0` allows.
+            // Scene-change detection stays on for screen content: OpenH264 forces it back on
+            // under ScreenContentRealTime and warns when asked for anything else.
             .debug(settings.debug_logging)
             .intra_frame_period(IntraFramePeriod::from_num_frames(INFINITE_INTRA_PERIOD))
             .vui(VuiConfig::bt709())
@@ -274,7 +299,9 @@ impl Openh264Encoder {
     /// Give every frame of a multi-threaded instance `slices` fixed slices, so its encoder
     /// threads and the client's decoder can parallelize within the frame; more than four slices
     /// upsets some Chromium decoders, so the count is pinned to four (`SM_FIXEDSLCNUM_SLICE`).
-    /// A single-threaded stripe instance keeps OpenH264's single slice and returns at once.
+    /// A single-threaded stripe instance keeps OpenH264's single slice and returns at once. The
+    /// same re-init shortens the long-term marking period (`LTR_MARK_PERIOD`), which the crate's
+    /// config fixes at 30.
     ///
     /// The `openh264` crate initializes the underlying encoder lazily on the *first* encode and
     /// exposes no fixed slicing through its config, so the routine primes the encoder with one
@@ -308,6 +335,9 @@ impl Openh264Encoder {
             params.sSpatialLayers[0].sSliceArgument.uiSliceMode =
                 openh264_sys2::SM_FIXEDSLCNUM_SLICE;
             params.sSpatialLayers[0].sSliceArgument.uiSliceNum = self.slices;
+            if self.refs.is_some() {
+                params.iLtrMarkPeriod = LTR_MARK_PERIOD;
+            }
             let ret = raw.set_option(
                 openh264_sys2::ENCODER_OPTION_SVC_ENCODE_PARAM_EXT,
                 &mut params as *mut _ as *mut std::ffi::c_void,
@@ -393,6 +423,7 @@ impl Openh264Encoder {
             self.current_bitrate_bps.max(1) as u32,
             qp as u8,
             self.threads,
+            self.refs.is_some(),
         ) {
             Some(encoder) => {
                 self.encoder = encoder;
@@ -550,36 +581,111 @@ impl Openh264Encoder {
         );
         match self.encoder.encode(&slices) {
             Ok(bitstream) => {
-                let header_sz = if self.omit_stripe_headers {
-                    0
-                } else {
-                    VIDEO_HEADER_LEN
+                let frame_type = match bitstream.frame_type() {
+                    FrameType::IDR => FRAME_KEY,
+                    FrameType::I => FRAME_INTRA,
+                    _ => FRAME_DELTA,
                 };
-                let mut out = Vec::with_capacity(header_sz);
-                if header_sz != 0 {
-                    let frame_type = match bitstream.frame_type() {
-                        FrameType::IDR => FRAME_KEY,
-                        FrameType::I => FRAME_INTRA,
-                        _ => FRAME_DELTA,
-                    };
-                    push_video_header(
-                        &mut out,
-                        Codec::H264,
-                        frame_type,
-                        frame_number as u16,
-                        y_start,
-                        self.width as u16,
-                        self.height as u16,
-                        Reference::Untracked,
-                    );
-                }
-                bitstream.write_vec(&mut out);
-                if out.len() == header_sz {
+                let mut body = Vec::new();
+                bitstream.write_vec(&mut body);
+                if body.is_empty() {
                     return Ok(Vec::new());
                 }
+                let (reference, anchor) = match self.refs.as_mut() {
+                    Some(refs) => refs.record(frame_number as u16, &body),
+                    None => (Reference::Untracked, false),
+                };
+                self.last_reference = reference;
+                if self.omit_stripe_headers {
+                    return Ok(body);
+                }
+                let mut out = Vec::with_capacity(VIDEO_HEADER_LEN + body.len());
+                push_video_header(
+                    &mut out,
+                    Codec::H264,
+                    frame_type | if anchor { FRAME_ANCHOR } else { 0 },
+                    frame_number as u16,
+                    y_start,
+                    self.width as u16,
+                    self.height as u16,
+                    reference,
+                );
+                out.extend_from_slice(&body);
                 Ok(out)
             }
             Err(e) => Err(format!("openh264 encode failed: {e:?}")),
+        }
+    }
+
+    /// The frame the last encoded frame predicted from: tracked for a full-frame instance, which
+    /// keeps long-term references.
+    pub fn last_reference(&self) -> Reference {
+        self.last_reference
+    }
+
+    /// Every consumer holds frame `frame_id`, or where not `held` was sent it: a held frame that
+    /// marked a long-term reference is confirmed to the encoder, which then takes it for a
+    /// recovery and marks the next.
+    pub fn acknowledge_reference(&mut self, frame_id: u16, held: bool) {
+        if let Some((idr_pic_id, frame_num)) = self
+            .refs
+            .as_mut()
+            .and_then(|r| r.acknowledge(frame_id, held))
+        {
+            self.feedback(openh264_sys2::LTR_MARKING_SUCCESS, idr_pic_id, frame_num);
+        }
+    }
+
+    /// A consumer lost frame `frame_id`: the next frame predicts from the confirmed long-term
+    /// reference where one precedes the loss. False where none does, or for a stripe of several,
+    /// which keeps none, and the caller codes a key frame instead.
+    pub fn invalidate_reference(&mut self, frame_id: u16) -> bool {
+        let Some(refs) = self.refs.as_mut() else {
+            return false;
+        };
+        let (recovery, failed) = refs.invalidate(frame_id);
+        for (idr_pic_id, frame_num) in failed {
+            self.feedback(openh264_sys2::LTR_MARKING_FAILED, idr_pic_id, frame_num);
+        }
+        match recovery {
+            Recovery::Ignored => true,
+            Recovery::KeyFrame => false,
+            Recovery::Request {
+                idr_pic_id,
+                last_correct,
+            } => {
+                let mut request: openh264_sys2::SLTRRecoverRequest = unsafe { std::mem::zeroed() };
+                request.uiFeedbackType = openh264_sys2::LTR_RECOVERY_REQUEST as u32;
+                request.uiIDRPicId = idr_pic_id;
+                request.iLastCorrectFrameNum = last_correct;
+                // -1: the decoder's own frame is unknown, which OpenH264 takes as a loss at once.
+                request.iCurrentFrameNum = -1;
+                let ret = unsafe {
+                    self.encoder.raw_api().set_option(
+                        openh264_sys2::ENCODER_LTR_RECOVERY_REQUEST,
+                        std::ptr::addr_of_mut!(request).cast(),
+                    )
+                };
+                ret == 0
+            }
+        }
+    }
+
+    fn feedback(
+        &mut self,
+        kind: openh264_sys2::KEY_FRAME_REQUEST_TYPE,
+        idr_pic_id: u32,
+        frame_num: i32,
+    ) {
+        let mut fb: openh264_sys2::SLTRMarkingFeedback = unsafe { std::mem::zeroed() };
+        fb.uiFeedbackType = kind as u32;
+        fb.uiIDRPicId = idr_pic_id;
+        fb.iLTRFrameNum = frame_num;
+        unsafe {
+            self.encoder.raw_api().set_option(
+                openh264_sys2::ENCODER_LTR_MARKING_FEEDBACK,
+                std::ptr::addr_of_mut!(fb).cast(),
+            );
         }
     }
 }
@@ -622,6 +728,133 @@ mod tests {
             }
         }
         f
+    }
+
+    /// The mean luma distance between two decoded pictures.
+    fn luma_apart(
+        a: &crate::webcam::convert::I420View<'_>,
+        b: &crate::webcam::convert::I420View<'_>,
+    ) -> f64 {
+        a.y.chunks(a.y_stride)
+            .zip(b.y.chunks(b.y_stride))
+            .take(a.height)
+            .flat_map(|(ra, rb)| {
+                ra[..a.width]
+                    .iter()
+                    .zip(&rb[..a.width])
+                    .map(|(&x, &y)| (x as f64 - y as f64).abs())
+            })
+            .sum::<f64>()
+            / (a.width * a.height) as f64
+    }
+
+    /// Two consumers share a full-frame session: one takes every frame, the other misses runs and
+    /// then every frame predicting from one it lacks, and once it has room reports the first frame
+    /// it missed. Every frame both hold is acknowledged, so OpenH264 confirms the long-term
+    /// references it marks; the frames marking them are anchors from the first marking on, each
+    /// predicting from a frame both hold; the frame after each report predicts from a confirmed
+    /// one the one behind holds and is an anchor too; the one behind decodes every frame it is
+    /// sent as the other does (OpenH264's decoder, Firefox's for WebRTC H.264 without FFmpeg),
+    /// and no frame after the first is a key frame. The runs reach both long-term indices.
+    #[test]
+    fn a_consumer_that_misses_frames_is_predicted_past_from_a_long_term_reference() {
+        use crate::webcam::decode::{Decoder as _, VideoDecoder};
+        let (w, h) = (320usize, 192usize);
+        let s = RustCaptureSettings {
+            width: w as i32,
+            height: h as i32,
+            target_fps: 30.0,
+            video_cbr_mode: true,
+            video_bitrate_kbps: 4000,
+            ..Default::default()
+        };
+        let mut enc = Openh264Encoder::new(&s).expect("openh264 init");
+        let (mut whole, mut part) = (
+            VideoDecoder::new(Codec::H264).unwrap(),
+            VideoDecoder::new(Codec::H264).unwrap(),
+        );
+        // (frames it has no room for, the frame its report goes ahead of)
+        let runs = [
+            (50..=60, 63u16),
+            (101..=104, 106),
+            (140..=150, 152),
+            (190..=191, 194),
+        ];
+        let mut holds = std::collections::HashMap::new();
+        let mut first_missed = None;
+        let mut recovered = Vec::new();
+        let mut anchors = Vec::new();
+        for i in 0..=230u16 {
+            if runs.iter().any(|r| r.1 == i) {
+                let first = first_missed.take().expect("a missing run");
+                assert!(
+                    enc.invalidate_reference(first),
+                    "{first} reported lost before {i}"
+                );
+            }
+            let out = enc
+                .encode_host_argb(
+                    &gradient_frame(w, h, i as usize),
+                    w * 4,
+                    i as u64,
+                    i == 0,
+                    false,
+                )
+                .expect("encode");
+            if out.is_empty() {
+                continue;
+            }
+            assert_eq!(
+                out[1] & 0x0f & !FRAME_ANCHOR == FRAME_KEY,
+                i == 0,
+                "frame {i} kind"
+            );
+            let reference = enc.last_reference();
+            let can = match reference {
+                Reference::None => true,
+                Reference::Frame(r) => holds.get(&r).copied().unwrap_or(false),
+                Reference::Untracked => false,
+            };
+            let sent = can && !runs.iter().any(|r| r.0.contains(&i));
+            if out[1] & FRAME_ANCHOR != 0 {
+                assert!(
+                    can,
+                    "anchor {i} predicts from {reference:?}, which the one behind lacks"
+                );
+                anchors.push(i);
+            }
+            let bits = &out[VIDEO_HEADER_LEN..];
+            assert!(whole.decode(bits).unwrap_or(false), "frame {i}");
+            if runs.iter().any(|r| r.1 == i) {
+                assert!(
+                    sent,
+                    "frame {i} after the report predicts from {reference:?}"
+                );
+                assert!(out[1] & FRAME_ANCHOR != 0, "frame {i} is an anchor");
+                recovered.push((i, reference));
+            }
+            if sent {
+                assert!(part.decode(bits).unwrap_or(false), "frame {i} sent");
+                let off = luma_apart(&whole.frame().unwrap(), &part.frame().unwrap());
+                assert!(off < 0.5, "frame {i} sent is {off:.3} off");
+                enc.acknowledge_reference(i, true);
+            } else if first_missed.is_none() {
+                first_missed = Some(i);
+            }
+            holds.insert(i, sent);
+        }
+        println!("recoveries (frame, predicting from): {recovered:?}; anchors {anchors:?}");
+        assert!(
+            anchors.iter().any(|&a| a < 50),
+            "no marking anchor before the first loss: {anchors:?}"
+        );
+        assert_eq!(recovered.len(), runs.len(), "{recovered:?}");
+        let distinct: std::collections::HashSet<i32> =
+            recovered.iter().map(|r| r.1.frame_id()).collect();
+        assert!(
+            distinct.len() >= 2,
+            "recoveries from one long-term frame only: {recovered:?}"
+        );
     }
 
     /// The stream declares the matrix its input was converted with: BT.709 at limited range.

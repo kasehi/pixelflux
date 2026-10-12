@@ -25,6 +25,9 @@ pub mod nvenc;
 /// build without `gpl`, and always built for the test suite.
 #[cfg(any(feature = "openh264", test))]
 pub mod oh264;
+/// The long-term references of an OpenH264 session, read off its own slice headers.
+#[cfg(any(feature = "openh264", test))]
+pub mod oh264_refs;
 /// PNG watermark overlay composited onto frames before encoding.
 pub mod overlay;
 pub mod reference;

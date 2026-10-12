@@ -1518,7 +1518,14 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<FrameE
                 (None, encoders::reference::ReferenceReport::Lost(frame_id)) => {
                     encoders::software::invalidate_reference(&mut stripes, frame_id)
                 }
-                (None, _) => true,
+                (None, encoders::reference::ReferenceReport::Held(frame_id)) => {
+                    encoders::software::acknowledge_reference(&mut stripes, frame_id, true);
+                    true
+                }
+                (None, encoders::reference::ReferenceReport::Sent(frame_id)) => {
+                    encoders::software::acknowledge_reference(&mut stripes, frame_id, false);
+                    true
+                }
             };
             if !taken {
                 cfg.controls.force_idr.store(true, Ordering::Relaxed);
