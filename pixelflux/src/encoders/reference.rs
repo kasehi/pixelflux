@@ -27,6 +27,16 @@ const ANCHOR_ALONE_EVERY: u64 = 48;
 /// misses it cannot be predicted past.
 const SETTLE_SLACK: u64 = 4;
 
+/// Of two anchors, the one marked predicts from the frame every consumer was sent (`settle`) only
+/// where that is one of the `SETTLE_RECENT` newest recent frames, which the buffer keeps beside two
+/// anchors on every device (`nvenc::anchor_count`). Further back the anchor costs the moving
+/// picture: NVENC's HEVC on a 1080p page scrolling at 8 Mbit/s, every consumer's acknowledgement
+/// late, averaged 49.3 dB from two frames back, 49.0 from three, 38.5 from four and 27.4 from the
+/// other anchor a period back (the frame sent to all of them past the recent ones), against 49.7.
+/// The anchor predicts from the frame before it then, and a consumer that loses frames is predicted
+/// past from the pinned anchor on its own report.
+const SETTLE_RECENT: usize = 2;
+
 /// The schedule keeps an anchor every consumer was sent until they all hold it, for up to
 /// `PENDING_PERIODS` anchor periods: a consumer slower to report than a period, as one on a
 /// narrow link is, would otherwise never see an anchor pinned past the key frame.
@@ -111,8 +121,9 @@ pub enum Invalidation {
 /// Where the consumers say which frames every one of them holds, or was sent (`acknowledge`),
 /// several of them share the stream and each recovers on its own: the newest anchor all of them
 /// hold is pinned, the schedule marking the other, so a loss of any depth is predicted past from a
-/// frame every consumer has; an anchor predicts from a frame they were all sent (`settle`), so each
-/// can decode it; and in H.264 the frame where `frame_num` wraps is an anchor too.
+/// frame every consumer has; an anchor predicts from a frame they were all sent where that is near
+/// (`settle`), so each can decode it; and in H.264 the frame where `frame_num` wraps is an anchor
+/// too.
 pub struct ReferenceWindow {
     frames: VecDeque<(u16, u64, bool)>,
     capacity: usize,
@@ -378,7 +389,7 @@ impl ReferenceWindow {
     /// the frames after the newest that is, so the anchor predicts from it and every consumer can
     /// decode it. The invalidation that does it, for the encoder; None where none is needed, no
     /// frame held is one they were all sent, or that one lies further back than `SETTLE_SLACK`
-    /// allows.
+    /// or, of two anchors, `SETTLE_RECENT` allows.
     pub fn settle(&mut self) -> Option<Invalidation> {
         if !self.acknowledging() {
             return None;
@@ -403,6 +414,18 @@ impl ReferenceWindow {
             .map(|f| f.1)
             .max()?;
         if !wraps && self.next_pts - shared > self.anchor_period() + SETTLE_SLACK {
+            return None;
+        }
+        if self.anchors.len() > 1
+            && !wraps
+            && !self
+                .frames
+                .iter()
+                .rev()
+                .filter(|f| !f.2)
+                .take(SETTLE_RECENT)
+                .any(|f| f.1 == shared)
+        {
             return None;
         }
         let &(first, _, _) = self.recent.iter().find(|f| f.1 > shared && !f.2)?;
@@ -1814,40 +1837,39 @@ mod tests {
     fn an_anchor_predicts_from_the_newest_frame_every_consumer_was_sent() {
         let mut w = ReferenceWindow::with_anchors(8, 2);
         feed(&mut w, 0..=11);
-        for id in 0..=9u16 {
+        for id in 0..=10u16 {
             assert!(w.acknowledge(id, true));
         }
         assert_eq!(w.plan_anchor(false), Some(1));
         assert_eq!(
             w.settle(),
-            Some(Invalidation::Forget(10)),
-            "10 and 11 are forgotten"
+            Some(Invalidation::Forget(11)),
+            "11 is forgotten"
         );
         assert!(w.predicts_from_shared());
-        assert_eq!(w.record_marked(12, false, Some(1)), Reference::Frame(9));
+        assert_eq!(w.record_marked(12, false, Some(1)), Reference::Frame(10));
         assert_eq!(
             w.record(13, false),
             Reference::Frame(12),
             "the stream goes on from the anchor"
         );
 
-        // Held by no consumer but the key frame: the anchor predicts from it.
+        // Of two anchors, one is not settled further back than the two newest recent frames:
+        // it predicts from the frame before it.
+        let mut w = ReferenceWindow::with_anchors(8, 2);
+        feed(&mut w, 0..=11);
+        for id in 0..=9u16 {
+            assert!(w.acknowledge(id, true));
+        }
+        assert_eq!(w.settle(), None, "9 is three frames back");
+        assert_eq!(w.record_marked(12, false, Some(1)), Reference::Frame(11));
+
+        // Held by no consumer but the key frame, the other anchor: not settled on it either.
         let mut w = ReferenceWindow::with_anchors(4, 2);
         feed(&mut w, 0..=11);
         assert!(w.acknowledge(0, true));
-        assert_eq!(w.settle(), Some(Invalidation::Forget(1)));
-        assert_eq!(w.record_marked(12, false, Some(1)), Reference::Frame(0));
-        assert_eq!(
-            w.predicting_anchor(),
-            Some(1),
-            "13 predicts from the anchor just marked"
-        );
-        assert_eq!(w.record(13, false), Reference::Frame(12));
-        assert_eq!(
-            w.predicting_anchor(),
-            None,
-            "and 14 from 13, a recent frame"
-        );
+        assert_eq!(w.settle(), None);
+        assert_eq!(w.record_marked(12, false, Some(1)), Reference::Frame(11));
 
         // A lone anchor is not marked while it would predict from the one it marks over, every
         // consumer holding frames since that the window let go: they all hold that one.
@@ -1972,18 +1994,16 @@ mod tests {
         assert_eq!(
             anchors,
             [
-                (72, Reference::Frame(60)),
+                (72, Reference::Frame(71)),
                 (84, Reference::Frame(83)),
                 (96, Reference::Frame(95)),
                 (108, Reference::Frame(107)),
                 (120, Reference::Frame(119)),
             ],
-            "a consumer holds nothing past 60: the anchor an anchor period on predicts from it, \
-             those further on from the frame before"
+            "a consumer holds nothing past 60: of two anchors, each predicts from the frame before"
         );
-        assert_eq!(w.invalidate(61), Invalidation::Ignored, "already left out");
         assert_eq!(w.invalidate(121), Invalidation::Ignored, "never sent");
-        assert!(matches!(w.invalidate(72), Invalidation::Forget(_)));
+        assert!(matches!(w.invalidate(61), Invalidation::Forget(_)));
         assert_eq!(
             w.predicting_anchor(),
             Some(1),
