@@ -9073,6 +9073,17 @@ impl ScreenCapture {
         py.detach(move || crate::wayland::dcclient::write(&app_socket_path(&display)?, entries))
             .map_err(pyo3::exceptions::PyRuntimeError::new_err)
     }
+    /// The mimes the selection `clipboard_write_app` last took has served to pasters,
+    /// in order, once it has served more than `after` of them or `timeout_s` has
+    /// passed (at most a minute).
+    fn clipboard_served_app(&self, py: Python<'_>, after: usize, timeout_s: f64) -> Vec<String> {
+        let timeout = Duration::from_secs_f64(if timeout_s.is_finite() {
+            timeout_s.clamp(0.0, 60.0)
+        } else {
+            0.0
+        });
+        py.detach(move || crate::wayland::dcclient::served(after, timeout))
+    }
     /// Drop the app compositor's selection.
     fn clipboard_clear_app(&self, py: Python<'_>, display: String) -> PyResult<()> {
         py.detach(move || crate::wayland::dcclient::clear(&app_socket_path(&display)?))

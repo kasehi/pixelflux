@@ -16,8 +16,8 @@
 use std::collections::HashMap;
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use pyo3::{Py, PyAny, Python};
@@ -45,6 +45,30 @@ use crate::wayland::wlclient::{
 /// How often a background thread wakes from its socket poll to check its stop
 /// flag, bounding unwatch/shutdown latency.
 const STOP_POLL: Duration = Duration::from_millis(500);
+
+/// The number of the last [`write`] and the mimes its selection has served in
+/// full, in order: a caller restoring the clipboard after a paste waits on it
+/// ([`served`]) for the paster's fetch instead of guessing how long it takes.
+static SERVED: Mutex<(u64, Vec<String>)> = Mutex::new((0, Vec::new()));
+static SERVED_GREW: Condvar = Condvar::new();
+/// Reads by this process in flight ([`read`]): a send answering one is not a
+/// paster's, and goes uncounted (a paste served beside one only waits longer).
+static OWN_READS: AtomicUsize = AtomicUsize::new(0);
+
+struct OwnRead;
+
+impl OwnRead {
+    fn begin() -> Self {
+        OWN_READS.fetch_add(1, Ordering::SeqCst);
+        OwnRead
+    }
+}
+
+impl Drop for OwnRead {
+    fn drop(&mut self) {
+        OWN_READS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 /// The two data-control protocol families behind one shape: both define the
 /// same manager/device/source/offer object graph with identical semantics, so
@@ -165,6 +189,8 @@ struct DcState {
     canceled: bool,
     /// Mime -> bytes served by the write path's source.
     serve: Vec<(String, Vec<u8>)>,
+    /// The write this source serves, as [`SERVED`] numbers it.
+    write_no: u64,
     sync_done: bool,
 }
 
@@ -225,10 +251,20 @@ impl DcState {
     }
 
     fn on_send(&mut self, mime_type: &str, fd: std::os::fd::OwnedFd) {
-        if let Some((_, data)) = self.serve.iter().find(|(m, _)| m == mime_type) {
-            let _ = write_fd_all(&fd, data, IO_TIMEOUT);
+        let sent = self
+            .serve
+            .iter()
+            .find(|(m, _)| m == mime_type)
+            .is_some_and(|(_, data)| write_fd_all(&fd, data, IO_TIMEOUT).is_ok());
+        // Taken while the fd is open: an own read cannot have returned yet.
+        let own = OWN_READS.load(Ordering::SeqCst) > 0;
+        // Closed before it counts as served, so the paster has seen EOF by then.
+        drop(fd);
+        let mut served = SERVED.lock().unwrap_or_else(|e| e.into_inner());
+        if sent && !own && served.0 == self.write_no {
+            served.1.push(mime_type.to_string());
+            SERVED_GREW.notify_all();
         }
-        // fd drops here, closing the pipe so the paster sees EOF.
     }
 }
 
@@ -458,6 +494,7 @@ pub(crate) fn read(socket_path: &str, mime: &str) -> Result<Option<Vec<u8>>, Str
         return Ok(None);
     }
     let (rd, wr) = pipe_cloexec()?;
+    let _own = OwnRead::begin();
     offer.receive(mime.to_string(), wr.as_fd());
     queue.flush().map_err(|e| format!("flush: {e}"))?;
     drop(wr);
@@ -495,6 +532,12 @@ pub(crate) fn write(socket_path: &str, entries: Vec<(String, Vec<u8>)>) -> Resul
         source.offer(mime.clone());
     }
     state.serve = entries;
+    state.write_no = {
+        let mut served = SERVED.lock().unwrap_or_else(|e| e.into_inner());
+        served.0 += 1;
+        served.1.clear();
+        served.0
+    };
     device.set_selection(Some(&source));
     bounded_roundtrip(&conn, &mut queue, &mut state)?;
     std::thread::Builder::new()
@@ -533,6 +576,16 @@ fn serve_selection(
     device.destroy();
     let _ = queue.flush();
     Ok(())
+}
+
+/// The mimes the last [`write`]'s selection has served, once it has served more
+/// than `after` of them or `timeout` has passed.
+pub(crate) fn served(after: usize, timeout: Duration) -> Vec<String> {
+    let served = SERVED.lock().unwrap_or_else(|e| e.into_inner());
+    let (served, _) = SERVED_GREW
+        .wait_timeout_while(served, timeout, |s| s.1.len() <= after)
+        .unwrap_or_else(|e| e.into_inner());
+    served.1.clone()
 }
 
 /// Drop the selection (the compositor also cancels whatever source held it).
