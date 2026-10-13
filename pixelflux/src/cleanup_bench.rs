@@ -13,7 +13,8 @@
 //! `CODEC` (h264, h265, vp8, vp9, av1, jpeg), `CPU` (1 forces software), `FULLFRAME` (1),
 //! `FULLCOLOR` (1 for 4:4:4), `DEPTH` (bits per sample),
 //! `TURBO` (1), `CBR` (1), `KBPS`, `CRF`, `PAINT_CRF`, `PAINT` (use_paint_over_quality, 1),
-//! `W`, `H`, `FPS`, `MOTION` and `STILL` (frames), `CARET` (frames per caret toggle, 0 none),
+//! `W`, `H`, `FPS`, `MOTION` and `STILL` (frames), `STEP` (rows the scroll moves a frame, 4), `CARET`
+//! (frames per caret toggle, 0 none),
 //! `RESUME` (frames of motion after the still phase), `TRIGGER` (paint-over trigger frames),
 //! `PRESTILL` (frames held still before the measured phase, which then opens with the screen
 //! moving `JUMP` rows at once: a window opening on a clean still screen), `IDR_AT` and `IDR_EVERY`
@@ -266,6 +267,7 @@ fn cleanup_bench() {
         ..Default::default()
     };
     let motion: usize = env("MOTION", 90);
+    let step: usize = env("STEP", 4);
     let prestill: usize = env("PRESTILL", 0);
     let jump: usize = env("JUMP", 0);
     let still: usize = env("STILL", 240);
@@ -319,13 +321,13 @@ fn cleanup_bench() {
     let mut frame = vec![0u8; w * 4 * h];
     for t in 0..total {
         let scroll = if t < motion {
-            t * 4
+            t * step
         } else if t < stop {
-            motion * 4
+            motion * step
         } else if t < stop + still {
-            motion * 4 + jump
+            motion * step + jump
         } else {
-            motion * 4 + jump + (t + 1 - stop - still) * 4
+            motion * step + jump + (t + 1 - stop - still) * step
         };
         let caret = caret_period > 0 && t >= stop && ((t - stop) / caret_period).is_multiple_of(2);
         canvas.frame(&mut frame, h, scroll, caret);
