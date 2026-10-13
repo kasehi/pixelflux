@@ -897,10 +897,15 @@ fn handle_record_endpoint(url: &str, body: &str) -> Option<String> {
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_secs())
                             .unwrap_or(0);
-                        format!(
-                            "{}/pixelflux-record-{ts}.mp4",
-                            record_dir.as_deref().unwrap_or("/tmp")
-                        )
+                        // The session's runtime directory is its own; /tmp is shared.
+                        let runtime = std::env::var("XDG_RUNTIME_DIR")
+                            .ok()
+                            .filter(|d| !d.is_empty());
+                        let dir = record_dir
+                            .as_deref()
+                            .or(runtime.as_deref())
+                            .unwrap_or("/tmp");
+                        format!("{dir}/pixelflux-record-{ts}.mp4")
                     }),
             };
             let mut opts = crate::recorder::RecordOptions::from_env(path);

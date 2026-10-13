@@ -632,16 +632,7 @@ pub fn start(opts: RecordOptions) -> Result<RecordingStatus, String> {
         }
     };
 
-    // The recording is the desktop: readable by its owner alone, and never written through a
-    // link someone else may have planted at a predictable name in a shared directory.
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&opts.path)
-        .map_err(|e| format!("cannot create {}: {e}", opts.path))?;
+    let file = open_recording(&opts.path)?;
     let shared = RecShared::new();
     let (tx, rx) = bounded::<Tap>(QUEUE_CAP);
     let audio_source = if opts.audio_socket.is_empty() {
@@ -1008,10 +999,65 @@ pub fn status_to_json(s: &RecordingStatus) -> serde_json::Value {
     })
 }
 
+/// Open the recording's file. The recording is the desktop: readable by its owner alone,
+/// never written through a link someone else may have planted at a predictable name in a
+/// shared directory, nor into a file there that is another's, or has another name too.
+fn open_recording(path: &str) -> Result<std::fs::File, String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| format!("cannot create {path}: {e}"))?;
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("cannot inspect {path}: {e}"))?;
+    if meta.uid() != unsafe { libc::geteuid() } || meta.nlink() != 1 {
+        return Err(format!("{path} is not this user's file alone"));
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("cannot restrict {path}: {e}"))?;
+    Ok(file)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// The recording opens only into a file of this user's alone: a new one, or one of its
+    /// own made private, never through a link nor into a file that has another name too.
+    #[test]
+    fn a_recording_opens_only_into_a_file_of_this_users_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("pf-record-open-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let p = |name: &str| dir.join(name).to_string_lossy().into_owned();
+        let mode = |name: &str| {
+            std::fs::metadata(dir.join(name))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777
+        };
+
+        assert!(open_recording(&p("new.mp4")).is_ok());
+        assert_eq!(mode("new.mp4"), 0o600);
+        std::fs::write(dir.join("own.mp4"), b"old").unwrap();
+        std::fs::set_permissions(dir.join("own.mp4"), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        assert!(open_recording(&p("own.mp4")).is_ok());
+        assert_eq!(mode("own.mp4"), 0o600);
+        std::os::unix::fs::symlink(dir.join("own.mp4"), dir.join("link.mp4")).unwrap();
+        assert!(open_recording(&p("link.mp4")).is_err());
+        std::fs::hard_link(dir.join("own.mp4"), dir.join("second-name.mp4")).unwrap();
+        assert!(open_recording(&p("second-name.mp4")).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     fn ogg_page(granule: u64, packets: &[&[u8]]) -> Vec<u8> {
         let mut out = b"OggS\0\0".to_vec();
