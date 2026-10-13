@@ -5368,7 +5368,9 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
     let popups = PopupManager::default();
 
     let mut seat = seat_state.new_wl_seat(&dh, "seat0");
-    seat.add_keyboard(XkbConfig::default(), 200, 25)
+    // Clients repeat a held key after 600 ms, the delay desktops default to: a remote key's
+    // release can land a few hundred milliseconds late, and a shorter delay types it again.
+    seat.add_keyboard(XkbConfig::default(), 600, 25)
         .expect("Failed to init keyboard");
     seat.add_pointer();
 
