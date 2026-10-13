@@ -14,6 +14,7 @@
 
 use std::fs;
 use std::io::{ErrorKind, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -99,6 +100,7 @@ impl RecordingSink {
     fn bind(path: String, fps: FrameRate) -> std::io::Result<Self> {
         let _ = fs::remove_file(&path);
         let listener = UnixListener::bind(&path)?;
+        crate::webcam::server::restrict_to_owner(&path)?;
         listener.set_nonblocking(true)?;
 
         let clients: Arc<Mutex<Vec<ClientHandle>>> = Arc::new(Mutex::new(Vec::new()));
@@ -115,6 +117,9 @@ impl RecordingSink {
             while !shutdown_acc.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        if !crate::webcam::server::peer_is_session_user(stream.as_raw_fd()) {
+                            continue;
+                        }
                         if let Err(e) = stream.set_write_timeout(Some(WRITE_TIMEOUT)) {
                             eprintln!("[recording_sink] set_write_timeout failed: {:?}", e);
                             continue;

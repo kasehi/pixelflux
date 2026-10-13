@@ -64,6 +64,7 @@ impl Server {
             Err(e) => return Err(e),
         }
         let listener = UnixListener::bind(path)?;
+        restrict_to_owner(path)?;
         listener.set_nonblocking(true)?;
         let wake_raw = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
         if wake_raw < 0 {
@@ -298,6 +299,29 @@ fn serve(
     }
 }
 
+/// Make a socket this process bound connectable by its user alone, whatever the umask.
+pub(crate) fn restrict_to_owner(path: &str) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+/// Whether a socket's peer runs as this process's user or as root, who passes the
+/// socket's mode anyway: one that connected before `restrict_to_owner` is refused here.
+pub(crate) fn peer_is_session_user(fd: RawFd) -> bool {
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let r = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(),
+            &mut len,
+        )
+    };
+    r == 0 && (cred.uid == unsafe { libc::geteuid() } || cred.uid == 0)
+}
+
 fn accept_clients(
     listener: &UnixListener,
     config: &[u8; CONFIG_SIZE],
@@ -307,6 +331,9 @@ fn accept_clients(
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
+                if !peer_is_session_user(stream.as_raw_fd()) {
+                    continue;
+                }
                 let _ = stream.set_nonblocking(true);
                 let fd = OwnedFd::from(stream);
                 match send_config_with_fd(fd.as_raw_fd(), config, ring_fd) {
@@ -336,6 +363,26 @@ mod tests {
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
     use std::time::{Duration, Instant};
+
+    /// The socket is its user's alone whatever the umask, and a peer of that user passes.
+    #[test]
+    fn the_socket_is_connectable_by_its_user_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("pxwc-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("cam.sock").to_string_lossy().into_owned();
+        let old = unsafe { libc::umask(0) };
+        let listener = UnixListener::bind(&path).unwrap();
+        unsafe { libc::umask(old) };
+        restrict_to_owner(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let _client = UnixStream::connect(&path).unwrap();
+        let (peer, _) = listener.accept().unwrap();
+        assert!(peer_is_session_user(peer.as_raw_fd()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     fn recv_config(stream: &UnixStream) -> (Vec<u8>, RawFd) {
         let mut data = vec![0u8; CONFIG_SIZE];
