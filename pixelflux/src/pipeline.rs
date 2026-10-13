@@ -196,10 +196,12 @@ pub enum Cleanup {
 /// no low motion, and counted, they would have the first frame of the next large change keyed,
 /// the whole picture at the paint-over quantizer the moment a window opens. `now` false (a
 /// stripe whose cleanup is staggered to a later frame) answers `Cleanup::None` and leaves the
-/// cleanup pending.
+/// cleanup pending. `start` is the still frames a refresh waits for: `trigger`, or one where the
+/// refresh runs through the rate control (`refresh_start`).
 pub fn cleanup_due(
     st: &mut StripeState,
     trigger: u32,
+    start: u32,
     improves: bool,
     now: bool,
     keys: bool,
@@ -225,6 +227,7 @@ pub fn cleanup_due(
     let due = due_cleanup(
         st,
         trigger.max(1),
+        start,
         keys,
         st.no_motion_frame_count,
         st.unclean_frames,
@@ -281,6 +284,7 @@ fn recent_motion(motion: f32, trigger: u32, moved: bool) -> f32 {
 fn due_cleanup(
     st: &StripeState,
     trigger: u32,
+    start: u32,
     keys: bool,
     still: u32,
     unclean: u32,
@@ -294,7 +298,7 @@ fn due_cleanup(
         && (still >= trigger * KEY_STILL_TRIGGERS || low_motion)
     {
         Cleanup::Key
-    } else if !st.paint_over_sent && (still >= trigger || low_motion) {
+    } else if !st.paint_over_sent && (still >= start || low_motion) {
         Cleanup::Refresh
     } else {
         Cleanup::None
@@ -303,18 +307,33 @@ fn due_cleanup(
 
 /// Whether `cleanup_due` would answer a cleanup for a frame that changed nothing, without moving
 /// the bookkeeping: what an idle frame has to know before it skips a region.
-pub fn cleanup_pending(st: &StripeState, trigger: u32, enabled: bool, keys: bool) -> bool {
+pub fn cleanup_pending(
+    st: &StripeState,
+    trigger: u32,
+    start: u32,
+    enabled: bool,
+    keys: bool,
+) -> bool {
     let unclean = st.unclean_frames.saturating_add(!st.paint_over_sent as u32);
     let motion = recent_motion(st.motion, trigger.max(1), false);
     enabled
         && due_cleanup(
             st,
             trigger.max(1),
+            start,
             keys,
             st.no_motion_frame_count.saturating_add(1),
             unclean,
             motion,
         ) != Cleanup::None
+}
+
+/// The still frames a refresh waits for (`cleanup_due`'s `start`): a refresh through the rate
+/// control (`converges`) is that rate control's own frames, each within its budget, so it starts
+/// on the first still frame, where waiting `trigger` frames only left the picture as the motion
+/// did; a refresh held at the paint-over quantizer waits for the screen to stay still.
+pub fn refresh_start(trigger: u32, converges: bool) -> u32 {
+    if converges { 1 } else { trigger.max(1) }
 }
 
 /// What an encoder says about the frames it codes, which the cleanup reads: the quality index
@@ -681,6 +700,7 @@ pub fn decide_hw_fullframe(
     let cleanup = cleanup_due(
         st,
         settings.paint_over_trigger(),
+        refresh_start(settings.paint_over_trigger(), converges),
         improves,
         true,
         holds && encoder.keys,
@@ -928,6 +948,7 @@ fn decide_constant_quality(
     let recovery_idr = requested_idr || periodic_idr_due(settings, frame_counter);
     let mut cleanup = cleanup_due(
         st,
+        settings.paint_over_trigger(),
         settings.paint_over_trigger(),
         improves,
         true,
@@ -1964,6 +1985,32 @@ mod tests {
         }
     }
 
+    /// A cleanup through the rate control starts on the first still frame, its frames the rate
+    /// control's own within its budget, where a held one still waits for the trigger.
+    #[test]
+    fn a_cleanup_through_the_rate_control_starts_on_the_first_still_frame() {
+        let s = RustCaptureSettings {
+            paint_over_trigger_frames: 15,
+            ..hw_settings()
+        };
+        let budget = frame_budget(s.video_bitrate_kbps, s.target_fps) as usize;
+        let rate = EncoderQuality {
+            last: Some(40),
+            bytes: Some(budget),
+            ..HOLDS
+        };
+        for (encoder, first) in [(rate, 1), (HOLDS, 15)] {
+            let mut st = StripeState::default();
+            decide_hw_fullframe(&mut st, &s, 0, Damage::Area(1.0), false, false, encoder);
+            let sent = (1..40u16)
+                .position(|i| {
+                    decide_hw_fullframe(&mut st, &s, i, Damage::None, false, false, encoder).send
+                })
+                .expect("a cleanup");
+            assert_eq!(sent + 1, first, "{encoder:?}");
+        }
+    }
+
     /// A consumer that lost frames after a cleanup gets the cleanup again on the next still frame:
     /// the frame predicting past its losses carries the stream's own quality, and without this the
     /// picture would stay as the motion left it until the screen next changes.
@@ -2042,7 +2089,7 @@ mod tests {
             psnr: None,
         };
         let trigger = s.paint_over_trigger_frames as u16;
-        let window = trigger + (FALLBACK_TRIGGERS as u16) * trigger;
+        let window = 1 + (FALLBACK_TRIGGERS as u16) * trigger;
         let mut st = StripeState::default();
         decide_hw_fullframe(&mut st, &s, 0, Damage::Area(1.0), false, false, refining);
         let still: Vec<HwFrameDecision> = (1..window)
@@ -2053,7 +2100,7 @@ mod tests {
             "no frame held, no key frame"
         );
         let first = still.iter().position(|d| d.send).expect("a cleanup");
-        assert_eq!(first + 1, trigger as usize, "due at the trigger");
+        assert_eq!(first, 0, "due on the first still frame");
         assert!(
             still[first..].iter().all(|d| d.send),
             "the frames keep flowing while it refines"
@@ -2213,7 +2260,7 @@ mod tests {
         let trigger = s.paint_over_trigger_frames as usize;
         assert_eq!(
             held[0] + 1,
-            trigger + (FALLBACK_TRIGGERS as usize) * trigger,
+            1 + (FALLBACK_TRIGGERS as usize) * trigger,
             "after the window"
         );
         assert_eq!(
@@ -2256,10 +2303,10 @@ mod tests {
             .map(|(i, _)| i)
             .collect();
         let trigger = s.paint_over_trigger_frames as usize;
-        let refresh = 2 * trigger - 1;
+        let refresh = trigger;
         assert_eq!(
             sent,
-            (trigger - 1..=refresh).collect::<Vec<_>>(),
+            (0..=refresh).collect::<Vec<_>>(),
             "a trigger period through the rate control, then the refresh"
         );
         assert_eq!(
@@ -2399,10 +2446,7 @@ mod tests {
         assert_eq!(still[held[0]].hold_qp, Some(held_refresh_quality(&s, idle)));
         assert!(!still[held[0]].force_idr, "a refresh, not a key frame");
         let stall = (STALL_TRIGGERS * s.paint_over_trigger_frames) as usize;
-        assert!(
-            held[0] + 1 >= s.paint_over_trigger_frames as usize + stall,
-            "after the stall, not at the trigger"
-        );
+        assert!(held[0] + 1 > stall, "after the stall, not at its start");
         assert!(
             still[held[0] + 1..].iter().all(|d| !d.send),
             "which ends the cleanup"

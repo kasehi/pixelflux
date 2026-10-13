@@ -1292,7 +1292,13 @@ pub fn stripes_held_still(stripes: &[StripeState], settings: &RustCaptureSetting
         && stripes.iter().any(|st| {
             st.clean_quality
                 || (st.burst_held && st.h264_burst_frames_remaining > 0)
-                || crate::pipeline::cleanup_pending(st, settings.paint_over_trigger(), true, true)
+                || crate::pipeline::cleanup_pending(
+                    st,
+                    settings.paint_over_trigger(),
+                    settings.paint_over_trigger(),
+                    true,
+                    true,
+                )
         })
 }
 
@@ -1453,13 +1459,20 @@ pub fn encode_cpu(
         )
     };
     let trigger_frames = settings.paint_over_trigger();
+    let start_frames = crate::pipeline::refresh_start(trigger_frames, converges);
     let idle_candidate = damage_rects.is_empty()
         && !force_idr_all
         && !(codec.is_video() && settings.video_streaming_mode);
     if idle_candidate {
         let no_pending_send = |st: &StripeState| {
             (!codec.is_video() || st.h264_burst_frames_remaining <= 0)
-                && !crate::pipeline::cleanup_pending(st, trigger_frames, paint_over_armed(st), keys)
+                && !crate::pipeline::cleanup_pending(
+                    st,
+                    trigger_frames,
+                    start_frames,
+                    paint_over_armed(st),
+                    keys,
+                )
         };
         let quiescent = if !hash_damage {
             stripes.iter().all(no_pending_send)
@@ -1485,7 +1498,15 @@ pub fn encode_cpu(
         if quiescent {
             for st in stripes.iter_mut() {
                 let armed = paint_over_armed(st);
-                crate::pipeline::cleanup_due(st, trigger_frames, armed, true, keys, Damage::None);
+                crate::pipeline::cleanup_due(
+                    st,
+                    trigger_frames,
+                    start_frames,
+                    armed,
+                    true,
+                    keys,
+                    Damage::None,
+                );
                 st.consecutive_changes = 0;
             }
             return Vec::new();
@@ -1568,7 +1589,13 @@ pub fn encode_cpu(
     let cleanup_allowed: Vec<bool> = stripes
         .iter()
         .map(|st| {
-            if !crate::pipeline::cleanup_pending(st, trigger_frames, paint_over_armed(st), keys) {
+            if !crate::pipeline::cleanup_pending(
+                st,
+                trigger_frames,
+                start_frames,
+                paint_over_armed(st),
+                keys,
+            ) {
                 return true;
             }
             granted += 1;
@@ -1594,6 +1621,7 @@ pub fn encode_cpu(
         let cleanup = crate::pipeline::cleanup_due(
             stripe_state,
             trigger_frames,
+            start_frames,
             armed,
             cleanup_allowed[i],
             keys,
