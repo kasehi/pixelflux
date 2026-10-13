@@ -52,7 +52,9 @@
         if (path === "" || isNaN(parseInt(path, 10))) {
             path = "0";
         }
-        const WEBSOCKET_URL = `${WEBSOCKET_HOST}/${path}`;
+        // The server takes only the token of its start, which the URL it prints carries.
+        const TOKEN = new URLSearchParams(window.location.search).get("token") || "";
+        const WEBSOCKET_URL = `${WEBSOCKET_HOST}/${path}?token=${encodeURIComponent(TOKEN)}`;
         // --- END DYNAMIC URL ---
 
         // Establish a WebSocket connection to the server.

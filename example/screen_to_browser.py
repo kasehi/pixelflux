@@ -19,7 +19,10 @@ costs bounded memory and resumes on a decodable frame.
 
 # Standard library imports
 import asyncio
+import hmac
+import http
 import os
+import secrets
 import mimetypes
 import time
 import urllib.parse
@@ -41,6 +44,9 @@ WS_PORT = 9000
 # open this socket and receive the screen. Only the page this server itself hands
 # out may; None keeps non-browser clients, which send no Origin, working.
 ALLOWED_ORIGINS = [f"http://localhost:{HTTP_PORT}", f"http://127.0.0.1:{HTTP_PORT}", f"http://[::1]:{HTTP_PORT}", None]
+# Any account on the host reaches localhost and can send any Origin: the socket also
+# takes only this start's token, which reaches the page in the URL printed below.
+TOKEN = secrets.token_urlsafe(16)
 
 # Send-side bounds, mirroring selkies' per-client video relay: the queue holds
 # at most ~2 seconds of stream at 60 fps; keyframe requests triggered by
@@ -243,11 +249,19 @@ async def send_stripes_task(websocket, queue):
     finally:
         print(f"Send task for {websocket.remote_address} has finished.")
 
+def require_token(connection, request):
+    """Refuse an upgrade without this start's token (401)."""
+    given = urllib.parse.parse_qs(urllib.parse.urlsplit(request.path).query).get("token", [""])[0]
+    if not hmac.compare_digest(given.encode(), TOKEN.encode()):
+        return connection.respond(http.HTTPStatus.UNAUTHORIZED, "token required\n")
+    return None
+
+
 async def websocket_handler(websocket):
     """
     Manages a single WebSocket connection and its dedicated screen capture lifecycle.
     """
-    path = websocket.request.path
+    path = urllib.parse.urlsplit(websocket.request.path).path
     client_id = id(websocket)
     print(f"New client connected from {websocket.remote_address} with path '{path}' (ID: {client_id}).")
 
@@ -428,7 +442,7 @@ async def handle_http_request(reader, writer):
             return
 
         try:
-            path = parts[1].decode().split('#')[0]  # Ignore hash part
+            path = parts[1].decode().split('#')[0].split('?')[0]  # Ignore hash and query
         except UnicodeDecodeError:
             writer.write(b'HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n')
             return
@@ -467,12 +481,12 @@ async def main():
 
     http_server = await asyncio.start_server(handle_http_request, 'localhost', HTTP_PORT)
     print(f"HTTP server serving on http://localhost:{HTTP_PORT}/")
-    print(f"-> Open http://localhost:{HTTP_PORT}/ to start a capture at (0,0).")
-    print(f"-> Open http://localhost:{HTTP_PORT}/#10 to start a capture at (10,0).")
+    print(f"-> Open http://localhost:{HTTP_PORT}/?token={TOKEN} to start a capture at (0,0).")
+    print(f"-> Open http://localhost:{HTTP_PORT}/?token={TOKEN}#10 to start a capture at (10,0).")
 
     ws_server = None
     try:
-        ws_server = await ws_async.serve(websocket_handler, 'localhost', WS_PORT,
+        ws_server = await ws_async.serve(websocket_handler, 'localhost', WS_PORT, process_request=require_token,
                                          compression=None, origins=ALLOWED_ORIGINS)
         print(f"WebSocket server started on ws://localhost:{WS_PORT}")
         print("Waiting for client connections... Press Ctrl+C to stop.")
