@@ -1290,12 +1290,7 @@ pub fn stripes_held_still(stripes: &[StripeState], settings: &RustCaptureSetting
         && stripes.iter().any(|st| {
             st.clean_quality
                 || (st.burst_held && st.h264_burst_frames_remaining > 0)
-                || crate::pipeline::cleanup_pending(
-                    st,
-                    settings.paint_over_trigger_frames,
-                    true,
-                    true,
-                )
+                || crate::pipeline::cleanup_pending(st, settings.paint_over_trigger(), true, true)
         })
 }
 
@@ -1348,7 +1343,7 @@ pub fn stripes_held_still(stripes: &[StripeState], settings: &RustCaptureSetting
 ///    which has no compositor damage) per-stripe content hashing drives dirtiness instead, in
 ///    streaming H.264 too, since the cleanup reads a still stripe from its content.
 /// 4. **Per-stripe cleanup** (`pipeline::cleanup_due`, one region per stripe): a stripe that
-///    changed is cleaned up once it has held still for `paint_over_trigger_frames`, or has kept
+///    changed is cleaned up once it has held still for `paint_over_trigger`, or has kept
 ///    changing only a little for four times that, at the paint-over JPEG quality or, for H.264,
 ///    at the paint-over quality: under CBR through libx264's rate control, the stripe sent until it
 ///    codes at the paint-over quantizer or finer in a small frame (`pipeline::convergence`), or its
@@ -1455,7 +1450,7 @@ pub fn encode_cpu(
             },
         )
     };
-    let trigger_frames = settings.paint_over_trigger_frames;
+    let trigger_frames = settings.paint_over_trigger();
     let idle_candidate = damage_rects.is_empty()
         && !force_idr_all
         && !(codec.is_video() && settings.video_streaming_mode);

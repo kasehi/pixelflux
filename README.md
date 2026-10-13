@@ -287,7 +287,7 @@ settings.omit_stripe_headers = False
 settings.video_min_qp = 0                          # CBR QP clamps: 0 = encoder default; max bounds the quality floor, min bounds bit waste on easy content
 settings.video_max_qp = 0
 settings.use_paint_over_quality = True  # Clean up a still screen at the paint-over quality, whatever video_streaming_mode sends
-settings.paint_over_trigger_frames = 15 # Frames without change before the cleanup (a screen changing only in small places gets it after four times this)
+settings.paint_over_trigger_frames = 15 # Frames without change before the cleanup, counted at 60 fps (a lower frame rate waits as long; a screen changing only in small places gets it after four times this)
 settings.damage_block_threshold = 10    # Consecutive changes to trigger "damaged" state
 settings.damage_block_duration = 30     # Frames a stripe stays "damaged"
 

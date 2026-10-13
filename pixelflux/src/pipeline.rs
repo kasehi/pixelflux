@@ -658,7 +658,7 @@ pub fn decide_hw_fullframe(
     let sweeps = holds && encoder.band.is_some();
     let cleanup = cleanup_due(
         st,
-        settings.paint_over_trigger_frames,
+        settings.paint_over_trigger(),
         improves,
         true,
         holds && encoder.keys,
@@ -754,7 +754,7 @@ pub fn decide_hw_fullframe(
         return d;
     }
     let budget = frame_budget(settings.video_bitrate_kbps, settings.target_fps);
-    let trigger = settings.paint_over_trigger_frames.max(1);
+    let trigger = settings.paint_over_trigger();
     if converges && st.h264_burst_frames_remaining > 0 {
         st.over_frames = if encoder
             .bytes
@@ -906,7 +906,7 @@ fn decide_constant_quality(
     let recovery_idr = requested_idr || periodic_idr_due(settings, frame_counter);
     let mut cleanup = cleanup_due(
         st,
-        settings.paint_over_trigger_frames,
+        settings.paint_over_trigger(),
         improves,
         true,
         true,
@@ -1913,6 +1913,28 @@ mod tests {
                 "keys {}: the key frames",
                 encoder.keys
             );
+        }
+    }
+
+    /// The trigger is counted at 60 fps: a slower session waits as long for its cleanup, not as
+    /// many frames.
+    #[test]
+    fn a_slower_session_waits_as_long_for_its_cleanup() {
+        for (fps, frames) in [(120.0, 15), (60.0, 15), (30.0, 8), (8.0, 2), (1.0, 1)] {
+            let s = RustCaptureSettings {
+                paint_over_trigger_frames: 15,
+                target_fps: fps,
+                ..hw_settings()
+            };
+            assert_eq!(s.paint_over_trigger(), frames, "{fps} fps");
+            let mut st = StripeState::default();
+            decide_hw_fullframe(&mut st, &s, 0, Damage::Area(1.0), false, false, HOLDS);
+            let first = (1..40u16)
+                .position(|i| {
+                    decide_hw_fullframe(&mut st, &s, i, Damage::None, false, false, HOLDS).send
+                })
+                .expect("a cleanup");
+            assert_eq!(first + 1, frames as usize, "{fps} fps: due at the trigger");
         }
     }
 

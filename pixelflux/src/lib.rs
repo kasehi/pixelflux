@@ -328,6 +328,7 @@ pub struct RustCaptureSettings {
     pub jpeg_quality: i32,
     pub paint_over_jpeg_quality: i32,
     pub use_paint_over_quality: bool,
+    /// Still frames before a cleanup, counted at `TRIGGER_FPS` (`paint_over_trigger`).
     pub paint_over_trigger_frames: u32,
     pub damage_block_threshold: u32,
     pub damage_block_duration: u32,
@@ -484,6 +485,19 @@ impl Default for RustCaptureSettings {
             video_min_qp: 0,
             video_max_qp: 0,
         }
+    }
+}
+
+/// The frame rate `paint_over_trigger_frames` is counted at.
+const TRIGGER_FPS: f64 = 60.0;
+
+impl RustCaptureSettings {
+    /// `paint_over_trigger_frames` at the session's frame rate: below `TRIGGER_FPS` the same
+    /// time (2 frames of 15 at 8 fps), above it the same frames.
+    pub fn paint_over_trigger(&self) -> u32 {
+        let frames = self.paint_over_trigger_frames.max(1);
+        let scaled = (f64::from(frames) * self.target_fps / TRIGGER_FPS).ceil();
+        (scaled as u32).clamp(1, frames)
     }
 }
 

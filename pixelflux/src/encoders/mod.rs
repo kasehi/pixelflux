@@ -521,7 +521,8 @@ pub fn paint_over_desc(
         return (settings.paint_over_jpeg_quality > settings.jpeg_quality).then(|| {
             format!(
                 "PaintOver Q: {} (Trigger: {}f)",
-                settings.paint_over_jpeg_quality, settings.paint_over_trigger_frames
+                settings.paint_over_jpeg_quality,
+                settings.paint_over_trigger()
             )
         });
     }
