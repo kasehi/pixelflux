@@ -825,6 +825,9 @@ impl JpegDecoder {
     }
 }
 
+/// The widest or tallest picture a camera's JPEG may claim, far past any webcam.
+const MAX_JPEG_SIDE: usize = 8192;
+
 impl Decoder for JpegDecoder {
     fn codec(&self) -> Codec {
         Codec::Jpeg
@@ -838,6 +841,14 @@ impl Decoder for JpegDecoder {
             .map_err(|e| DecodeError::Corrupt(format!("jpeg header: {}", e)))?;
         if hdr.width == 0 || hdr.height == 0 {
             return Err(DecodeError::Corrupt("empty jpeg".into()));
+        }
+        // The header is the peer's word, and the buffers are sized from it before any
+        // pixel decodes.
+        if hdr.width > MAX_JPEG_SIDE || hdr.height > MAX_JPEG_SIDE {
+            return Err(DecodeError::Corrupt(format!(
+                "jpeg of {}x{}",
+                hdr.width, hdr.height
+            )));
         }
         self.out.resize(hdr.width, hdr.height);
         if hdr.subsamp == Subsamp::Sub2x2 {
@@ -968,6 +979,30 @@ mod tests {
         assert!((mid as i32 - 200).abs() <= 3, "luma {}", mid);
         let cu = v.u[(h / 4) * v.uv_stride + w / 4];
         assert!((cu as i32 - 100).abs() <= 3, "cb {}", cu);
+    }
+
+    /// A JPEG whose header claims a picture past `MAX_JPEG_SIDE` is refused before its
+    /// buffers are sized from the claim (65535x65535 would ask 6 GiB of the session host).
+    #[test]
+    fn a_jpeg_claiming_a_huge_picture_is_refused_before_allocating() {
+        let (w, h) = (16usize, 16usize);
+        let img = I420Buffer::new(w, h);
+        let src = YuvImage {
+            pixels: &img.data[..],
+            width: w,
+            align: 1,
+            height: h,
+            subsamp: Subsamp::Sub2x2,
+        };
+        let mut jpeg = turbojpeg::compress_yuv(src, 90).unwrap().to_vec();
+        // SOF0: FF C0, length, precision, then height and width.
+        let sof = jpeg.windows(2).position(|m| m == [0xFF, 0xC0]).unwrap();
+        jpeg[sof + 5..sof + 9].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
+        let mut dec = JpegDecoder::new().unwrap();
+        let err = dec.decode(&jpeg).unwrap_err();
+        assert!(matches!(err, DecodeError::Corrupt(_)), "{err:?}");
+        assert!(dec.out.data.len() < 1 << 20, "{} bytes", dec.out.data.len());
+        assert!(dec.rgb.len() < 1 << 20, "{} bytes", dec.rgb.len());
     }
 
     /// Every inter-coded codec has a decoder, and none holds a picture before decoding one.
