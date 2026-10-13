@@ -3078,6 +3078,18 @@ impl Dispatch<ZwpVirtualKeyboardV1, PfVirtualKeyboard> for AppState {
                 if format != 1 {
                     return;
                 }
+                // The size is the client's word: mapping past the file's end faults the
+                // compositor thread. A keymap is tens of kilobytes.
+                const MAX_KEYMAP_BYTES: u64 = 4 << 20;
+                let file = std::fs::File::from(fd);
+                let length = file.metadata().map(|m| m.len()).unwrap_or(0);
+                if size == 0 || u64::from(size) > length || u64::from(size) > MAX_KEYMAP_BYTES {
+                    eprintln!(
+                        "[Wayland] virtual-keyboard keymap of {size} bytes in a {length}-byte file; ignoring."
+                    );
+                    return;
+                }
+                let fd = std::os::fd::OwnedFd::from(file);
                 let ctx = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
                 let keymap = unsafe {
                     xkb::Keymap::new_from_fd(
