@@ -6,7 +6,9 @@
 
 //! A most-significant-bit-first writer for the headers a VA-API session packs itself: the
 //! fixed-width and Exp-Golomb fields of H.264, HEVC, and AV1 syntax, the RBSP trailing bits,
-//! and the emulation prevention an H.26x NAL unit needs on its way out.
+//! and the emulation prevention an H.26x NAL unit needs on its way out; and the split of an
+//! Annex-B stream into its NAL units on the way in. Nothing here reaches outside the module,
+//! so a fuzz build (`fuzz/`) compiles it on its own.
 
 /// Bits appended most significant first.
 #[derive(Default)]
@@ -123,6 +125,31 @@ pub fn nal_unit(header: &[u8], rbsp: &[u8]) -> Vec<u8> {
     out.extend_from_slice(header);
     out.extend(escape(rbsp));
     out
+}
+
+/// The NAL units of an Annex-B stream, each without its start code and never empty.
+pub(crate) fn annexb_nals(au: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let mut starts = Vec::new();
+    let mut i = 0usize;
+    while i + 2 < au.len() {
+        if au[i] == 0 && au[i + 1] == 0 && au[i + 2] == 1 {
+            starts.push(i + 3);
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    let mut nals = Vec::with_capacity(starts.len());
+    for (n, &start) in starts.iter().enumerate() {
+        let mut end = starts.get(n + 1).map_or(au.len(), |&next| next - 3);
+        while end > start && au[end - 1] == 0 {
+            end -= 1;
+        }
+        if end > start {
+            nals.push(&au[start..end]);
+        }
+    }
+    nals.into_iter()
 }
 
 #[cfg(test)]

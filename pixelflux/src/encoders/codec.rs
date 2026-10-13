@@ -850,30 +850,7 @@ pub fn av1_is_key(tu: &[u8]) -> bool {
     false
 }
 
-/// The NAL units of an Annex-B stream, each without its start code and never empty.
-pub(crate) fn annexb_nals(au: &[u8]) -> impl Iterator<Item = &[u8]> {
-    let mut starts = Vec::new();
-    let mut i = 0usize;
-    while i + 2 < au.len() {
-        if au[i] == 0 && au[i + 1] == 0 && au[i + 2] == 1 {
-            starts.push(i + 3);
-            i += 3;
-        } else {
-            i += 1;
-        }
-    }
-    let mut nals = Vec::with_capacity(starts.len());
-    for (n, &start) in starts.iter().enumerate() {
-        let mut end = starts.get(n + 1).map_or(au.len(), |&next| next - 3);
-        while end > start && au[end - 1] == 0 {
-            end -= 1;
-        }
-        if end > start {
-            nals.push(&au[start..end]);
-        }
-    }
-    nals.into_iter()
-}
+pub(crate) use super::bits::annexb_nals;
 
 /// Whether a non-IDR H.264 slice header opens an I/SI slice. Reads `first_mb_in_slice`
 /// and `slice_type` (both ue(v)) from the start of the slice RBSP, undoing emulation
