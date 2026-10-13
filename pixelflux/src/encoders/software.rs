@@ -1082,6 +1082,8 @@ pub struct StripeState {
     pub paint_over_sent: bool,
     pub dirty_run: u32,
     pub change_mass: f32,
+    /// Whether the region moved (`Damage::is_motion`) since its last cleanup.
+    pub moved: bool,
     pub unclean_frames: u32,
     /// Whether the last cleanup was a key frame (`pipeline::lost_frame` repeats its kind).
     pub cleanup_keyed: bool,
@@ -1459,7 +1461,9 @@ pub fn encode_cpu(
         )
     };
     let trigger_frames = settings.paint_over_trigger();
-    let start_frames = crate::pipeline::refresh_start(trigger_frames, converges);
+    // A stripe's change is read from its hash, of no known extent, so a caret reads as motion:
+    // its cleanup waits the trigger, through the rate control or not.
+    let start_frames = trigger_frames;
     let idle_candidate = damage_rects.is_empty()
         && !force_idr_all
         && !(codec.is_video() && settings.video_streaming_mode);

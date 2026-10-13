@@ -196,8 +196,8 @@ pub enum Cleanup {
 /// no low motion, and counted, they would have the first frame of the next large change keyed,
 /// the whole picture at the paint-over quantizer the moment a window opens. `now` false (a
 /// stripe whose cleanup is staggered to a later frame) answers `Cleanup::None` and leaves the
-/// cleanup pending. `start` is the still frames a refresh waits for: `trigger`, or one where the
-/// refresh runs through the rate control (`refresh_start`).
+/// cleanup pending. `start` is the still frames a refresh after motion waits for: `trigger`, or
+/// one where the refresh runs through the rate control (`refresh_start`).
 pub fn cleanup_due(
     st: &mut StripeState,
     trigger: u32,
@@ -211,6 +211,7 @@ pub fn cleanup_due(
         st.dirty_run = st.dirty_run.saturating_add(1);
         st.no_motion_frame_count = 0;
         st.paint_over_sent = false;
+        st.moved |= damage.is_motion();
         st.change_mass += match damage {
             Damage::Area(f) => f,
             _ if st.dirty_run >= UNKNOWN_RUN => UNKNOWN_MASS,
@@ -244,6 +245,7 @@ pub fn cleanup_due(
         return Cleanup::None;
     }
     st.paint_over_sent = true;
+    st.moved = false;
     st.unclean_frames = 0;
     st.cleanup_keyed = due == Cleanup::Key;
     if due == Cleanup::Key {
@@ -298,7 +300,8 @@ fn due_cleanup(
         && (still >= trigger * KEY_STILL_TRIGGERS || low_motion)
     {
         Cleanup::Key
-    } else if !st.paint_over_sent && (still >= start || low_motion) {
+    } else if !st.paint_over_sent && (still >= if st.moved { start } else { trigger } || low_motion)
+    {
         Cleanup::Refresh
     } else {
         Cleanup::None
@@ -328,10 +331,12 @@ pub fn cleanup_pending(
         ) != Cleanup::None
 }
 
-/// The still frames a refresh waits for (`cleanup_due`'s `start`): a refresh through the rate
-/// control (`converges`) is that rate control's own frames, each within its budget, so it starts
-/// on the first still frame, where waiting `trigger` frames only left the picture as the motion
-/// did; a refresh held at the paint-over quantizer waits for the screen to stay still.
+/// The still frames a refresh after the region moved waits for (`cleanup_due`'s `start`): a refresh
+/// through the rate control (`converges`) is that rate control's own frames, each within its
+/// budget, so it starts on the first still frame, where waiting `trigger` frames only left the
+/// picture as the motion did; a refresh held at the paint-over quantizer waits for the screen to
+/// stay still. A region that changed only a little (a caret, a keystroke) waits `trigger` either
+/// way, or a caret blinking on a clean screen would send every frame.
 pub fn refresh_start(trigger: u32, converges: bool) -> u32 {
     if converges { 1 } else { trigger.max(1) }
 }
@@ -1985,8 +1990,9 @@ mod tests {
         }
     }
 
-    /// A cleanup through the rate control starts on the first still frame, its frames the rate
-    /// control's own within its budget, where a held one still waits for the trigger.
+    /// A cleanup through the rate control starts on the first still frame after motion, its frames
+    /// the rate control's own within its budget, where a held one, and one after a change as small
+    /// as a caret's, still waits for the trigger.
     #[test]
     fn a_cleanup_through_the_rate_control_starts_on_the_first_still_frame() {
         let s = RustCaptureSettings {
@@ -1999,15 +2005,15 @@ mod tests {
             bytes: Some(budget),
             ..HOLDS
         };
-        for (encoder, first) in [(rate, 1), (HOLDS, 15)] {
+        for (change, encoder, first) in [(1.0, rate, 1), (1.0, HOLDS, 15), (0.01, rate, 15)] {
             let mut st = StripeState::default();
-            decide_hw_fullframe(&mut st, &s, 0, Damage::Area(1.0), false, false, encoder);
+            decide_hw_fullframe(&mut st, &s, 0, Damage::Area(change), false, false, encoder);
             let sent = (1..40u16)
                 .position(|i| {
                     decide_hw_fullframe(&mut st, &s, i, Damage::None, false, false, encoder).send
                 })
                 .expect("a cleanup");
-            assert_eq!(sent + 1, first, "{encoder:?}");
+            assert_eq!(sent + 1, first, "{change} {encoder:?}");
         }
     }
 
