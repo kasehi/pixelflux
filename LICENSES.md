@@ -74,8 +74,8 @@ contains it.
 ## Rust crates
 
 The crate graph was resolved with `cargo metadata` (normal dependencies only,
-Linux targets) for both configurations: 238 crates in the default (GPL) build,
-237 in the non-GPL build, 238 distinct crates in total. Every one of them has a
+Linux targets) for both configurations: 234 crates in the default (GPL) build,
+233 in the non-GPL build, 234 distinct crates in total. Every one of them has a
 permissive license (MPL-2.0 for `pixelflux` itself); no crate is GPL, LGPL,
 AGPL, or unlicensed. The only difference between the two sets:
 
@@ -83,12 +83,12 @@ AGPL, or unlicensed. The only difference between the two sets:
 | --- | --- | --- | --- |
 | `x264-sys` 0.2.3 | MIT (links libx264, GPL-2.0-or-later) | GPL only | `gpl` feature; the OpenH264 crates stay in both builds, since their decoder is the virtual camera's H.264 decoder |
 
-License expressions as published by the crates (count of the 238):
-MIT OR Apache-2.0 (and spellings of it) 127, MIT 67, MIT OR Apache-2.0 OR Zlib (and spellings of it) 11, Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT 6, BSD-2-Clause 5, BSD-3-Clause 4, Unlicense OR MIT 4, BSD-3-Clause OR Apache-2.0 3, BSD-2-Clause OR Apache-2.0 OR MIT 2, ISC 2, and one each of (MIT OR Apache-2.0) AND Unicode-3.0 (`unicode-ident`), 0BSD OR MIT OR Apache-2.0 (`adler2`), Apache-2.0 (`gethostname`), BSL-1.0 (`xxhash-rust`), CC0-1.0 OR Apache-2.0 (`imgref`), MPL-2.0 (`pixelflux`), Zlib (`zlib-rs`). `scripts/check-licenses.py --markdown` regenerates the full
+License expressions as published by the crates (count of the 234):
+MIT OR Apache-2.0 (and spellings of it) 123, MIT 67, MIT OR Apache-2.0 OR Zlib (and spellings of it) 11, Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT 6, BSD-2-Clause 5, BSD-3-Clause 4, Unlicense OR MIT 4, BSD-3-Clause OR Apache-2.0 3, BSD-2-Clause OR Apache-2.0 OR MIT 2, ISC 2, and one each of (MIT OR Apache-2.0) AND Unicode-3.0 (`unicode-ident`), 0BSD OR MIT OR Apache-2.0 (`adler2`), Apache-2.0 (`gethostname`), BSL-1.0 (`xxhash-rust`), CC0-1.0 OR Apache-2.0 (`imgref`), MPL-2.0 (`pixelflux`), Zlib (`zlib-rs`). `scripts/check-licenses.py --markdown` regenerates the full
 table below.
 
 <details>
-<summary>All 238 crates (Build: both, GPL only, non-GPL only)</summary>
+<summary>All 234 crates (Build: both, GPL only, non-GPL only)</summary>
 
 | Crate | Version | License (SPDX) | Category | Build | Native library / note |
 | --- | --- | --- | --- | --- | --- |
@@ -100,7 +100,6 @@ table below.
 | arg_enum_proc_macro | 0.3.4 | MIT | permissive | both |  |
 | arrayvec | 0.7.8 | MIT OR Apache-2.0 | permissive | both |  |
 | as-slice | 0.2.1 | MIT OR Apache-2.0 | permissive | both |  |
-| ascii | 1.1.0 | Apache-2.0 OR MIT | permissive | both |  |
 | async-broadcast | 0.7.2 | MIT OR Apache-2.0 | permissive | both |  |
 | async-channel | 2.5.0 | Apache-2.0 OR MIT | permissive | both |  |
 | async-executor | 1.14.0 | Apache-2.0 OR MIT | permissive | both |  |
@@ -127,7 +126,6 @@ table below.
 | calloop | 0.14.4 | MIT | permissive | both |  |
 | cfg-if | 1.0.5 | MIT OR Apache-2.0 | permissive | both |  |
 | chacha20 | 0.10.2 | MIT OR Apache-2.0 | permissive | both |  |
-| chunked_transfer | 1.5.0 | MIT OR Apache-2.0 | permissive | both |  |
 | codec-sys | 0.1.0 | MIT OR Apache-2.0 | permissive | both | libvpx, SVT-AV1, dav1d, and libde265 on every wheel; x265 (GPL-2.0-or-later) on the GPL wheel, kvazaar on the non-GPL one (BSD-3-Clause (libvpx, kvazaar; SVT-AV1 with the Alliance for Open Media patent license), BSD-2-Clause (dav1d), LGPL-3.0-or-later (libde265), weak copyleft) |
 | color_quant | 1.1.0 | MIT | permissive | both |  |
 | concurrent-queue | 2.5.0 | Apache-2.0 OR MIT | permissive | both |  |
@@ -173,7 +171,6 @@ table below.
 | hashbrown | 0.17.1 | MIT OR Apache-2.0 | permissive | both |  |
 | heck | 0.5.0 | MIT OR Apache-2.0 | permissive | both |  |
 | hex | 0.4.3 | MIT OR Apache-2.0 | permissive | both |  |
-| httpdate | 1.0.3 | MIT OR Apache-2.0 | permissive | both |  |
 | image | 0.25.10 | MIT OR Apache-2.0 | permissive | both |  |
 | image-webp | 0.2.4 | MIT OR Apache-2.0 | permissive | both |  |
 | imgref | 1.12.3 | CC0-1.0 OR Apache-2.0 | permissive | both |  |
@@ -277,7 +274,6 @@ table below.
 | thiserror-impl | 1.0.69 | MIT OR Apache-2.0 | permissive | both |  |
 | thiserror-impl | 2.0.20 | MIT OR Apache-2.0 | permissive | both |  |
 | tiff | 0.11.3 | MIT | permissive | both |  |
-| tiny_http | 0.12.0 | MIT OR Apache-2.0 | permissive | both |  |
 | toml_datetime | 1.1.1+spec-1.1.0 | MIT OR Apache-2.0 | permissive | both |  |
 | toml_edit | 0.25.15+spec-1.1.0 | MIT OR Apache-2.0 | permissive | both |  |
 | toml_parser | 1.1.3+spec-1.1.0 | MIT OR Apache-2.0 | permissive | both |  |

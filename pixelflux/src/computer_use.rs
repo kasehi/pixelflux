@@ -26,10 +26,11 @@
 
 use std::collections::HashMap;
 use std::io::Cursor;
-use std::io::Read;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, ToSocketAddrs};
+use std::io::{Read, Write};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -39,7 +40,6 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use image::{ImageBuffer, ImageFormat, Rgba};
 use serde::Deserialize;
-use tiny_http;
 
 use crate::ThreadCommand;
 use crate::wayland::keymap::keysym_for_char;
@@ -1028,25 +1028,21 @@ pub fn start_cu_server(bind: &str, token: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
-/// Whether `request` carries the server's token, compared in constant time.
-fn authorized(request: &tiny_http::Request) -> bool {
+/// Whether an `Authorization` value carries the server's token, compared in constant time.
+fn authorized(authorization: Option<&str>) -> bool {
     let Some(token) = CU_TOKEN.get() else {
         return false;
     };
-    request.headers().iter().any(|h| {
-        h.field.equiv("Authorization")
-            && h.value
-                .as_str()
-                .strip_prefix("Bearer ")
-                .is_some_and(|given| {
-                    given.len() == token.len()
-                        && given
-                            .bytes()
-                            .zip(token.bytes())
-                            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-                            == 0
-                })
-    })
+    authorization
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .is_some_and(|given| {
+            given.len() == token.len()
+                && given
+                    .bytes()
+                    .zip(token.bytes())
+                    .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                    == 0
+        })
 }
 
 /// Bound listeners for a CU bind: for each comma-separated entry, both loopback
@@ -1219,96 +1215,41 @@ pub fn run_cu_server(listener: TcpListener) {
         .local_addr()
         .map(|a| a.to_string())
         .unwrap_or_default();
-    let server = match tiny_http::Server::from_listener(listener, None) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("[ComputerUse] Failed to start server on {addr}: {e}");
-            return;
-        }
-    };
     println!("[ComputerUse] Server listening on {addr}");
+    // Requests are read on threads of their own, bounded in count, size, and time before
+    // the token is checked, and acted on here one at a time.
+    let (tx, rx) = mpsc::sync_channel::<(TcpStream, String, String)>(MAX_CU_PENDING);
+    let pending = Arc::new(AtomicUsize::new(0));
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            if pending.fetch_add(1, Ordering::AcqRel) >= MAX_CU_PENDING {
+                pending.fetch_sub(1, Ordering::AcqRel);
+                continue;
+            }
+            let (tx, pending) = (tx.clone(), pending.clone());
+            thread::spawn(move || {
+                if let Some(request) = read_cu_request(stream) {
+                    let _ = tx.send(request);
+                }
+                pending.fetch_sub(1, Ordering::AcqRel);
+            });
+        }
+    });
 
     let mut last_backend = "";
-    for mut request in server.incoming_requests() {
-        if !authorized(&request) {
-            let _ = request.respond(
-                tiny_http::Response::from_string("{\"error\":\"unauthorized\"}".to_string())
-                    .with_status_code(401)
-                    .with_header(
-                        "WWW-Authenticate: Bearer"
-                            .parse::<tiny_http::Header>()
-                            .unwrap(),
-                    )
-                    .with_header(
-                        "Content-Type: application/json"
-                            .parse::<tiny_http::Header>()
-                            .unwrap(),
-                    ),
-            );
-            continue;
-        }
-        // A CU body is a single input command: cap its size so a hostile client
-        // cannot exhaust memory with a giant POST.
-        const MAX_CU_BODY: u64 = 4 * 1024 * 1024;
-        let mut body = String::new();
-        if let Err(e) = request
-            .as_reader()
-            .take(MAX_CU_BODY + 1)
-            .read_to_string(&mut body)
-        {
-            let _ = request.respond(
-                tiny_http::Response::from_string(format!("{{\"error\":\"{}\"}}", e))
-                    .with_status_code(400)
-                    .with_header(
-                        "Content-Type: application/json"
-                            .parse::<tiny_http::Header>()
-                            .unwrap(),
-                    ),
-            );
-            continue;
-        }
-
-        if body.len() as u64 > MAX_CU_BODY {
-            let resp = tiny_http::Response::from_string(
-                "{\"error\":\"request body too large\"}".to_string(),
-            )
-            .with_status_code(413)
-            .with_header(
-                "Content-Type: application/json"
-                    .parse::<tiny_http::Header>()
-                    .unwrap(),
-            );
-            let _ = request.respond(resp);
-            continue;
-        }
-
-        if let Some(json) = handle_record_endpoint(request.url(), &body) {
-            let _ = request.respond(
-                tiny_http::Response::from_string(json)
-                    .with_status_code(200)
-                    .with_header(
-                        "Content-Type: application/json"
-                            .parse::<tiny_http::Header>()
-                            .unwrap(),
-                    ),
-            );
+    for (mut stream, url, body) in rx {
+        if let Some(json) = handle_record_endpoint(&url, &body) {
+            cu_respond(&mut stream, 200, &json);
             continue;
         }
 
         let parsed: CuActionRequest = match serde_json::from_str(&body) {
             Ok(r) => r,
             Err(e) => {
-                let _ = request.respond(
-                    tiny_http::Response::from_string(format!(
-                        "{{\"error\":\"Invalid JSON: {}\"}}",
-                        e
-                    ))
-                    .with_status_code(400)
-                    .with_header(
-                        "Content-Type: application/json"
-                            .parse::<tiny_http::Header>()
-                            .unwrap(),
-                    ),
+                cu_respond(
+                    &mut stream,
+                    400,
+                    &format!("{{\"error\":\"Invalid JSON: {}\"}}", e),
                 );
                 continue;
             }
@@ -1324,14 +1265,182 @@ pub fn run_cu_server(listener: TcpListener) {
             }
             Err(e) => format!("{{\"error\":\"{}\"}}", e.replace('"', "\\\"")),
         };
-        let _ = request.respond(
-            tiny_http::Response::from_string(json_response)
-                .with_status_code(200)
-                .with_header(
-                    "Content-Type: application/json"
-                        .parse::<tiny_http::Header>()
-                        .unwrap(),
-                ),
+        cu_respond(&mut stream, 200, &json_response);
+    }
+}
+
+/// The most a CU request's line and headers may take; its body is one command.
+const MAX_CU_HEAD: usize = 16 * 1024;
+const MAX_CU_BODY: usize = 4 * 1024 * 1024;
+/// Connections whose requests are being read or wait to be acted on; more are closed.
+const MAX_CU_PENDING: usize = 16;
+/// How long a connection has to send its request.
+const CU_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Read one HTTP/1.1 request: `(stream, path, body)` for an authorized one; anything
+/// else is answered here (401, 4xx) or dropped, before more than its head is read.
+fn read_cu_request(mut stream: TcpStream) -> Option<(TcpStream, String, String)> {
+    stream.set_read_timeout(Some(CU_READ_TIMEOUT)).ok()?;
+    stream.set_write_timeout(Some(CU_READ_TIMEOUT)).ok()?;
+    let mut buf = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 4096];
+    let head_end = loop {
+        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break i;
+        }
+        if buf.len() > MAX_CU_HEAD {
+            cu_respond(&mut stream, 431, "{\"error\":\"request head too large\"}");
+            return None;
+        }
+        let n = stream.read(&mut chunk).ok()?;
+        if n == 0 {
+            return None;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    };
+    let head = std::str::from_utf8(&buf[..head_end]).ok()?;
+    let mut lines = head.split("\r\n");
+    let path = lines.next()?.split(' ').nth(1)?.to_string();
+    let (mut authorization, mut length, mut chunked) = (None, Some(0usize), false);
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        if name.eq_ignore_ascii_case("authorization") {
+            authorization = Some(value);
+        } else if name.eq_ignore_ascii_case("content-length") {
+            length = value.parse().ok();
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            chunked = true;
+        }
+    }
+    if !authorized(authorization) {
+        cu_respond(&mut stream, 401, "{\"error\":\"unauthorized\"}");
+        return None;
+    }
+    let Some(length) = length.filter(|_| !chunked) else {
+        cu_respond(
+            &mut stream,
+            411,
+            "{\"error\":\"a Content-Length is required\"}",
+        );
+        return None;
+    };
+    if length > MAX_CU_BODY {
+        cu_respond(&mut stream, 413, "{\"error\":\"request body too large\"}");
+        return None;
+    }
+    let mut body = buf.split_off(head_end + 4);
+    body.truncate(length);
+    if body.len() < length {
+        let have = body.len();
+        body.resize(length, 0);
+        stream.read_exact(&mut body[have..]).ok()?;
+    }
+    match String::from_utf8(body) {
+        Ok(body) => Some((stream, path, body)),
+        Err(_) => {
+            cu_respond(&mut stream, 400, "{\"error\":\"body is not UTF-8\"}");
+            None
+        }
+    }
+}
+
+/// Answer a request with a JSON body and close the connection.
+fn cu_respond(stream: &mut TcpStream, status: u16, json: &str) {
+    let reason = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        411 => "Length Required",
+        413 => "Payload Too Large",
+        _ => "Request Header Fields Too Large",
+    };
+    let challenge = if status == 401 {
+        "WWW-Authenticate: Bearer\r\n"
+    } else {
+        ""
+    };
+    let _ = write!(
+        stream,
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{challenge}Connection: close\r\n\r\n{json}",
+        json.len()
+    );
+    let _ = stream.flush();
+}
+
+#[cfg(test)]
+mod request_tests {
+    use super::{CU_TOKEN, MAX_CU_BODY, read_cu_request};
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+
+    /// Send `raw` as a client, read it as the server does: what the reader returned and
+    /// what the client was answered.
+    fn exchange(raw: Vec<u8>) -> (Option<(String, String)>, String) {
+        let token = CU_TOKEN.get_or_init(|| "cu-test-token".into()).clone();
+        let raw = String::from_utf8_lossy(&raw)
+            .replace("TOKEN", &token)
+            .into_bytes();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let mut c = TcpStream::connect(addr).unwrap();
+            let _ = c.write_all(&raw);
+            let _ = c.shutdown(std::net::Shutdown::Write);
+            let mut answer = String::new();
+            let _ = c.read_to_string(&mut answer);
+            answer
+        });
+        let (stream, _) = listener.accept().unwrap();
+        let got = read_cu_request(stream).map(|(_, path, body)| (path, body));
+        (got, client.join().unwrap())
+    }
+
+    /// A request is read only so far as the bounds allow, and only an authorized one past
+    /// its head: a huge header line, a missing token, and an oversized body are answered
+    /// without the server reading on.
+    #[test]
+    fn a_request_is_bounded_and_authorized_before_its_body_is_read() {
+        let body = r#"{"action":"screenshot"}"#;
+        let (got, _) = exchange(
+            format!("POST /computer-use HTTP/1.1\r\nAuthorization: Bearer TOKEN\r\nContent-Length: {}\r\n\r\n{body}", body.len())
+                .into_bytes(),
+        );
+        assert_eq!(got, Some(("/computer-use".into(), body.into())));
+
+        let mut huge = b"POST /computer-use HTTP/1.1\r\nX-Pad: ".to_vec();
+        huge.resize(huge.len() + (1 << 20), b'a');
+        let (got, answer) = exchange(huge);
+        assert!(
+            got.is_none() && answer.starts_with("HTTP/1.1 431"),
+            "{answer}"
+        );
+
+        let (got, answer) =
+            exchange(b"POST /computer-use HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}".to_vec());
+        assert!(
+            got.is_none() && answer.starts_with("HTTP/1.1 401"),
+            "{answer}"
+        );
+        assert!(answer.contains("WWW-Authenticate: Bearer"), "{answer}");
+
+        let (got, answer) = exchange(
+            format!("POST /computer-use HTTP/1.1\r\nAuthorization: Bearer TOKEN\r\nContent-Length: {}\r\n\r\n", MAX_CU_BODY + 1)
+                .into_bytes(),
+        );
+        assert!(
+            got.is_none() && answer.starts_with("HTTP/1.1 413"),
+            "{answer}"
+        );
+
+        let (got, answer) = exchange(
+            b"POST /computer-use HTTP/1.1\r\nAuthorization: Bearer TOKEN\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n".to_vec(),
+        );
+        assert!(
+            got.is_none() && answer.starts_with("HTTP/1.1 411"),
+            "{answer}"
         );
     }
 }
