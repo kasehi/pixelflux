@@ -267,6 +267,9 @@ impl WlCapture {
     }
 
     fn take_report(&mut self, report: crate::encoders::reference::ReferenceReport) {
+        if let crate::encoders::reference::ReferenceReport::Lost(_) = report {
+            self.vaapi_state.lost_frame();
+        }
         if self.encode_pool.is_some() {
             self.encode_controls
                 .reference_reports

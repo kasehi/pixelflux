@@ -1527,6 +1527,10 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<FrameE
         // torn down is already gone, and its last frames are not recorded.
         let recording_sink = cfg.recording_sink.as_ref().and_then(|w| w.upgrade());
         for report in std::mem::take(&mut *cfg.controls.reference_reports.lock().unwrap()) {
+            if let encoders::reference::ReferenceReport::Lost(_) = report {
+                hw_state.lost_frame();
+                stripes.iter_mut().for_each(StripeState::lost_frame);
+            }
             let taken = match (video_encoder.as_mut(), report) {
                 (Some(encoder), report) => encoder.take_report(report),
                 (None, encoders::reference::ReferenceReport::Lost(frame_id)) => {

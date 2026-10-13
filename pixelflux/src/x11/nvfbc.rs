@@ -992,6 +992,9 @@ where
         }
 
         for report in std::mem::take(&mut *controls.reference_reports.lock().unwrap()) {
+            if let crate::encoders::reference::ReferenceReport::Lost(_) = report {
+                state.lost_frame();
+            }
             if !gpu.encoder.take_report(report) {
                 pending_force_idr = true;
             }

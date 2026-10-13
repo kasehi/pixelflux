@@ -242,10 +242,32 @@ pub fn cleanup_due(
     }
     st.paint_over_sent = true;
     st.unclean_frames = 0;
+    st.cleanup_keyed = due == Cleanup::Key;
     if due == Cleanup::Key {
         st.change_mass = 0.0;
     }
     due
+}
+
+impl StripeState {
+    /// A consumer lost a frame of this region's stream (`invalidate_reference`). A cleanup already
+    /// sent may be among the frames it lost, and the frame predicting past them is coded at the
+    /// stream's own quality, from whatever frame is left to predict from: over a gate that held a
+    /// low frame rate's frames back on a long path, the anchor, seconds old, whose picture shows
+    /// through the recovery as a ghost. A region that was clean is due its cleanup again, of the
+    /// kind it lost (a key frame clears what the anchor left), or the picture would stay as the
+    /// loss left it until the region next changes.
+    pub fn lost_frame(&mut self) {
+        if self.paint_over_sent {
+            self.paint_over_sent = false;
+            self.settled = false;
+            self.sweep = None;
+            self.h264_burst_frames_remaining = 0;
+            if self.cleanup_keyed {
+                self.change_mass = self.change_mass.max(KEY_CLEANUP_MASS);
+            }
+        }
+    }
 }
 
 /// The share of a region's recent frames that carried more than a small change, `motion` taking
@@ -1260,6 +1282,10 @@ impl X11Pipeline {
     /// every frame after it out of the predictions, a key frame where the encoder cannot.
     pub fn take_report(&mut self, report: crate::encoders::reference::ReferenceReport) {
         use crate::encoders::reference::ReferenceReport;
+        if let ReferenceReport::Lost(_) = report {
+            self.hw_state.lost_frame();
+            self.stripes.iter_mut().for_each(StripeState::lost_frame);
+        }
         let taken = match (self.hw.as_mut(), report) {
             (Some(enc), report) => enc.take_report(report),
             (None, ReferenceReport::Lost(frame_id)) => {
@@ -1936,6 +1962,55 @@ mod tests {
                 .expect("a cleanup");
             assert_eq!(first + 1, frames as usize, "{fps} fps: due at the trigger");
         }
+    }
+
+    /// A consumer that lost frames after a cleanup gets the cleanup again on the next still frame:
+    /// the frame predicting past its losses carries the stream's own quality, and without this the
+    /// picture would stay as the motion left it until the screen next changes.
+    #[test]
+    fn a_cleanup_a_consumer_lost_is_coded_again() {
+        let s = hw_settings();
+        let still = |st: &mut StripeState, from: u16| -> Vec<bool> {
+            (from..from + 300)
+                .map(|i| decide_hw_fullframe(st, &s, i, Damage::None, false, false, HOLDS).send)
+                .collect()
+        };
+        let mut st = StripeState::default();
+        decide_hw_fullframe(&mut st, &s, 0, Damage::Area(1.0), false, false, HOLDS);
+        let first = still(&mut st, 1);
+        let cleaned = first.iter().filter(|&&sent| sent).count();
+        assert!(cleaned > 0, "a cleanup");
+        assert!(
+            first[240..].iter().all(|&sent| !sent),
+            "then a quiet still screen"
+        );
+        // A whole screen changed, so the cleanup ended on a key frame after its refresh.
+        let keyed = st.cleanup_keyed;
+        assert!(keyed, "the last cleanup a key frame");
+        st.lost_frame();
+        st.lost_frame();
+        let again = decide_hw_fullframe(&mut st, &s, 301, Damage::None, false, false, HOLDS);
+        assert!(
+            again.send && again.hold_qp.is_some(),
+            "the lost cleanup is coded again: {} {:?}",
+            again.send,
+            again.hold_qp
+        );
+        assert_eq!(again.force_idr, keyed, "and as the kind it was");
+        let rest = still(&mut st, 302);
+        assert!(
+            rest[240..].iter().all(|&sent| !sent),
+            "and the screen is quiet again"
+        );
+        assert!(
+            rest.iter().filter(|&&sent| sent).count() < cleaned,
+            "two losses re-arm one cleanup, no larger than the first"
+        );
+        // A loss while the region still changes owes nothing yet: its cleanup is still to come.
+        let mut moving = StripeState::default();
+        decide_hw_fullframe(&mut moving, &s, 0, Damage::Area(1.0), false, false, HOLDS);
+        moving.lost_frame();
+        assert!(!moving.paint_over_sent);
     }
 
     /// A still screen the rate control codes finer than the paint-over quantizer owes no cleanup,

@@ -1083,6 +1083,8 @@ pub struct StripeState {
     pub dirty_run: u32,
     pub change_mass: f32,
     pub unclean_frames: u32,
+    /// Whether the last cleanup was a key frame (`pipeline::lost_frame` repeats its kind).
+    pub cleanup_keyed: bool,
     pub motion: f32,
     pub burst_held: bool,
     pub clean_quality: bool,
