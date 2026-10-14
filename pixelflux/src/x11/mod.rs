@@ -1280,7 +1280,14 @@ where
                 thread::yield_now();
             }
             let trigger = wait_for_frame(&conn, damage.as_ref(), &pace, frame_dur);
-            pace.ticked(trigger, frame_dur, Instant::now(), false);
+            let woke = Instant::now();
+            pace.ticked(trigger, frame_dur, woke, false);
+            // A tick that finds the screen still gives a change after it the pull a fresh
+            // capture has: the changes before it spent the budget, which a still screen's
+            // frames, never late, do not pay back.
+            if trigger == TickTrigger::Timer && damage.is_some() && pace.still(frame_dur, woke) {
+                pace.stood_still();
+            }
             if controls.stop.load(Ordering::Relaxed) {
                 break;
             }

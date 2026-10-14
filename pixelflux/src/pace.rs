@@ -51,6 +51,9 @@ const INPUT_BORROW_REFILL: f64 = 1.0 / 32.0;
 /// still renders its own frames instead of landing just behind a timer frame and waiting a
 /// period.
 const TIMER_GRACE_AFTER_PULL: f64 = 0.25;
+/// The periods without a reported change after which the screen counts as still
+/// (`FramePace::still`): more than the timer waits after a change's frame.
+const STILL_PERIODS: f64 = 1.5;
 /// The input spacings, as shares of the frame period, that count as pacing at the cadence:
 /// a client at the cadence give or take its jitter. A faster client is borrowing frames and a
 /// slower one is content the timer paces, and the timer keeps its period behind either.
@@ -104,6 +107,8 @@ pub struct FramePace {
     deferred_until: Option<Instant>,
     /// The last damage frame, and the running average of the spacing between damage frames.
     last_damage: Option<Instant>,
+    /// A still tick gave the next pull a fresh capture's budget, which that pull spends whole.
+    rephase: bool,
     damage_spacing: Option<Duration>,
 }
 
@@ -156,6 +161,8 @@ impl FramePace {
             };
             if trigger.refills() {
                 self.borrow_budget = Some((left, now));
+            } else if std::mem::take(&mut self.rephase) {
+                self.phase_budget = Some(Duration::ZERO);
             } else {
                 self.phase_budget = Some(left);
             }
@@ -199,6 +206,22 @@ impl FramePace {
         } else {
             period.mul_f64(TIMER_TICK_MIN_FRACTION)
         }
+    }
+
+    /// Whether the screen stands still at `now`: no change reported for `STILL_PERIODS` periods,
+    /// longer than the timer waits after a change's frame, so a screen that keeps changing never
+    /// does.
+    pub fn still(&self, period: Duration, now: Instant) -> bool {
+        self.last_damage
+            .is_none_or(|at| now.saturating_duration_since(at) >= period.mul_f64(STILL_PERIODS))
+    }
+
+    /// Give the next change the pull a fresh capture has, for a tick that found the screen
+    /// still (`Self::still`): it moves the cadence onto the change and leaves nothing to
+    /// borrow, so the frame after it waits a whole period.
+    pub fn stood_still(&mut self) {
+        self.phase_budget = None;
+        self.rephase = true;
     }
 
     /// Hold the timer off this capture until `until` without a frame counting: a tick that
@@ -591,6 +614,64 @@ mod pacing_tests {
             (100..=101).contains(&frames),
             "{frames} frames in two seconds at 50 fps"
         );
+    }
+
+    /// The X11 capture's wait on a screen that stands still between changes: its still ticks
+    /// give each change the whole pull, so a change is due as it lands from half a period after
+    /// a tick on, however many came before it (counted without it, the changes spent the budget
+    /// and waited for the timer), and the frame after it waits a whole period.
+    #[test]
+    fn changes_between_still_periods_pull_as_a_fresh_capture_does() {
+        let base = Instant::now();
+        let mut pace = FramePace::default();
+        let mut t = base;
+        for i in 0..40u32 {
+            let change = t + PERIOD * 16 + Duration::from_micros(500 + u64::from(i) * 470 % 19_000);
+            let mut tick = t;
+            loop {
+                let due = pace.next_due(PERIOD, t);
+                if due >= change {
+                    break;
+                }
+                t = due;
+                tick = t;
+                pace.ticked(TickTrigger::Timer, PERIOD, t, false);
+                if pace.still(PERIOD, t) {
+                    pace.stood_still();
+                }
+            }
+            let at = pace
+                .pull_at(TickTrigger::Damage, PERIOD, change)
+                .max(change);
+            assert!(
+                at <= change.max(tick + PERIOD / 2),
+                "change {i} waited {:?}",
+                at - change
+            );
+            pace.ticked(TickTrigger::Damage, PERIOD, at, false);
+            assert_eq!(
+                pace.pull_at(TickTrigger::Damage, PERIOD, at),
+                at + PERIOD,
+                "the change after change {i} borrows nothing"
+            );
+            t = at;
+        }
+    }
+
+    /// The screen stands still only once a period and a half has passed without a change: the
+    /// timer's tick after a change's frame, graced or not, still counts as a frame.
+    #[test]
+    fn the_screen_is_still_a_period_and_a_half_after_its_last_change() {
+        let base = Instant::now();
+        let mut pace = FramePace::default();
+        assert!(pace.still(PERIOD, base), "a capture with no change yet");
+        pace.ticked(TickTrigger::Damage, PERIOD, base, false);
+        assert!(
+            !pace.still(PERIOD, at(base, 25)),
+            "the graced timer's tick after a change's frame"
+        );
+        assert!(!pace.still(PERIOD, at(base, 29)));
+        assert!(pace.still(PERIOD, at(base, 30)), "a period and a half on");
     }
 
     #[test]
