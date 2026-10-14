@@ -1220,7 +1220,8 @@ fn band_rects(dirty: &[bool], width: i32, height: i32) -> Vec<Rectangle<i32, Phy
 /// Run `encode` on this thread while a thread of its own hashes the frame's bands (`hash_bands`),
 /// and return what `encode` returned with the bands that changed: a Turbo frame's hash kept off
 /// its encode's path. A scoped thread per frame rather than the rayon pool, whose idle workers
-/// spin after every wake; where no thread starts, the hash runs here after the encode.
+/// spin after every wake; where no thread starts, the hash runs here after the encode. The
+/// thread keeps to the CPUs sharing this one's last-level cache (`share_cache_with`).
 #[allow(clippy::too_many_arguments)]
 fn hash_beside<R>(
     bands: &mut Vec<StripeState>,
@@ -1231,10 +1232,12 @@ fn hash_beside<R>(
     duration: i32,
     encode: impl FnOnce() -> R,
 ) -> (R, Vec<bool>) {
+    let cpu = unsafe { libc::sched_getcpu() };
     let (out, hashed) = std::thread::scope(|s| {
         let hashing = std::thread::Builder::new()
             .name("pxf-x11-hash".into())
             .spawn_scoped(s, || {
+                share_cache_with(cpu);
                 hash_bands(bands, pixels, stride, height, threshold, duration)
             });
         let out = encode();
@@ -1243,6 +1246,82 @@ fn hash_beside<R>(
     let dirty =
         hashed.unwrap_or_else(|| hash_bands(bands, pixels, stride, height, threshold, duration));
     (out, dirty)
+}
+
+/// Keep this thread to the CPUs it may run on that share `cpu`'s last-level cache.
+///
+/// A thread started per frame is placed on the least loaded CPU, on a host of several caches
+/// often under another one: its read of a frame leaves the frame's lines there, and the X
+/// server's next grab into that surface waits on every one of them (a 1280x720 grab took 2.0 ms
+/// against 0.9 on a four-node EPYC, the frame published that much later), while the read
+/// evicts whatever else runs there. Beside the encode, which has just read the same frame, it
+/// costs neither. A CPU whose caches the kernel does not list, or a cache of no CPU this thread
+/// may use, leaves it where it is.
+fn share_cache_with(cpu: i32) {
+    static CACHES: std::sync::Mutex<std::collections::BTreeMap<i32, Option<libc::cpu_set_t>>> =
+        std::sync::Mutex::new(std::collections::BTreeMap::new());
+    if cpu < 0 {
+        return;
+    }
+    let Some(cache) = *CACHES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(cpu)
+        .or_insert_with(|| last_cache_cpus(cpu))
+    else {
+        return;
+    };
+    let size = std::mem::size_of::<libc::cpu_set_t>();
+    unsafe {
+        let mut allowed: libc::cpu_set_t = std::mem::zeroed();
+        if libc::sched_getaffinity(0, size, &mut allowed) != 0 {
+            return;
+        }
+        let mut keep: libc::cpu_set_t = std::mem::zeroed();
+        for c in 0..libc::CPU_SETSIZE as usize {
+            if libc::CPU_ISSET(c, &cache) && libc::CPU_ISSET(c, &allowed) {
+                libc::CPU_SET(c, &mut keep);
+            }
+        }
+        if libc::CPU_COUNT(&keep) > 0 && !libc::CPU_EQUAL(&keep, &allowed) {
+            libc::sched_setaffinity(0, size, &keep);
+        }
+    }
+}
+
+/// The CPUs sharing `cpu`'s last-level cache, the highest level its sysfs cache entries list.
+fn last_cache_cpus(cpu: i32) -> Option<libc::cpu_set_t> {
+    let (_, list) = std::fs::read_dir(format!("/sys/devices/system/cpu/cpu{cpu}/cache"))
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let dir = entry.path();
+            let level: u32 = std::fs::read_to_string(dir.join("level"))
+                .ok()?
+                .trim()
+                .parse()
+                .ok()?;
+            Some((
+                level,
+                std::fs::read_to_string(dir.join("shared_cpu_list")).ok()?,
+            ))
+        })
+        .max_by_key(|(level, _)| *level)?;
+    cpu_list(&list)
+}
+
+/// A kernel CPU list ("0-3,32-35") as a set.
+fn cpu_list(list: &str) -> Option<libc::cpu_set_t> {
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    for part in list.trim().split(',').filter(|p| !p.is_empty()) {
+        let (first, last) = part.split_once('-').unwrap_or((part, part));
+        for c in first.parse::<usize>().ok()?..=last.parse::<usize>().ok()? {
+            if c < libc::CPU_SETSIZE as usize {
+                unsafe { libc::CPU_SET(c, &mut set) };
+            }
+        }
+    }
+    (unsafe { libc::CPU_COUNT(&set) } > 0).then_some(set)
 }
 
 /// Everything the X11 host-ARGB path has to remember between frames.
@@ -1869,6 +1948,41 @@ mod tests {
     /// frame or not: a refresh held at the paint-over quantizer after the trigger, a key frame
     /// held there once it has held still four trigger periods, each followed by the recovery
     /// burst, then silence (or Turbo's frames at the session quality).
+    #[test]
+    fn a_kernel_cpu_list_reads_as_its_cpus() {
+        let set = cpu_list("0-3,32-35\n").unwrap();
+        let cpus: Vec<usize> = (0..64)
+            .filter(|&c| unsafe { libc::CPU_ISSET(c, &set) })
+            .collect();
+        assert_eq!(cpus, [0, 1, 2, 3, 32, 33, 34, 35]);
+        assert!(cpu_list("").is_none());
+        assert!(cpu_list("x").is_none());
+    }
+
+    #[test]
+    fn the_hash_thread_keeps_to_cpus_it_was_allowed() {
+        let size = std::mem::size_of::<libc::cpu_set_t>();
+        let cpu = unsafe { libc::sched_getcpu() };
+        let (before, after) = std::thread::spawn(move || unsafe {
+            let mut before: libc::cpu_set_t = std::mem::zeroed();
+            libc::sched_getaffinity(0, size, &mut before);
+            share_cache_with(cpu);
+            let mut after: libc::cpu_set_t = std::mem::zeroed();
+            libc::sched_getaffinity(0, size, &mut after);
+            (before, after)
+        })
+        .join()
+        .unwrap();
+        let within = |set: &libc::cpu_set_t, of: &libc::cpu_set_t| {
+            (0..libc::CPU_SETSIZE as usize)
+                .all(|c| unsafe { !libc::CPU_ISSET(c, set) || libc::CPU_ISSET(c, of) })
+        };
+        assert!(unsafe { libc::CPU_COUNT(&after) } > 0 && within(&after, &before));
+        if let Some(cache) = last_cache_cpus(cpu) {
+            assert!(within(&after, &cache) || unsafe { libc::CPU_EQUAL(&after, &before) });
+        }
+    }
+
     #[test]
     fn a_still_screen_is_cleaned_up_whatever_turbo_sends() {
         for turbo in [false, true] {
