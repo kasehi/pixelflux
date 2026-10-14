@@ -930,12 +930,13 @@ fn sweep_refresh(st: &mut StripeState, d: &mut HwFrameDecision) {
 /// The session stays at the paint-over quality while the region stays clean: from its cleanup
 /// until motion (more than a small change), so the frames Turbo sends of a still screen, or a
 /// caret blinking on it, do not take a re-opening encoder back to the session's quality, a key
-/// frame at it, after `QP_HYSTERESIS_LIMIT` frames. The refresh, the key frame, and the bursts
-/// come when `cleanup_due` says, as at a constant rate; a requested or scheduled key frame is
-/// coded at the session's own quality, as on main, and its burst at the paint-over one. An
-/// encoder whose quality change re-opens it (`EncoderQuality::reopens`: x265, kvazaar, SVT-AV1)
-/// codes the refresh that moves it as a key frame, as main's paint-over did, so that refresh is
-/// its key-frame cleanup and no second key frame follows for the same change.
+/// frame at it, after `QP_HYSTERESIS_LIMIT` frames. The refresh and the bursts come when
+/// `cleanup_due` says, as at a constant rate, and no key-frame cleanup follows: on NVENC at CRF 25
+/// and paint-over 18 it lifted the end 0.8 dB for five times the bytes, one key frame of 415 kB
+/// where the refresh is 100. A requested or scheduled key frame is coded at the session's own
+/// quality, as on main, and its burst at the paint-over one. An encoder whose quality change
+/// re-opens it (`EncoderQuality::reopens`: x265, kvazaar, SVT-AV1) codes the refresh that moves it
+/// as a key frame, as main's paint-over did.
 fn decide_constant_quality(
     st: &mut StripeState,
     settings: &RustCaptureSettings,
@@ -957,7 +958,7 @@ fn decide_constant_quality(
         settings.paint_over_trigger(),
         improves,
         true,
-        true,
+        false,
         damage,
     );
     if damage.is_motion() || !improves {
@@ -3072,9 +3073,9 @@ mod tests {
     }
 
     /// At a constant quality the cleanup moves the session's quality to the paint-over one,
-    /// holding no frame: the refresh at the trigger and its burst, the key frame four trigger
-    /// periods in and its burst, and under Turbo every frame from the refresh on, since a region
-    /// stays at the paint-over quality until it moves again.
+    /// holding no frame and coding no key frame: the refresh at the trigger and its burst, and
+    /// under Turbo every frame from the refresh on, since a region stays at the paint-over quality
+    /// until it moves again.
     #[test]
     fn a_constant_quality_cleanup_moves_the_session_quality() {
         for turbo in [false, true] {
@@ -3108,15 +3109,8 @@ mod tests {
                     (3, false, paint),
                     (4, false, paint),
                     (5, false, paint),
-                    (8, true, paint),
-                    (9, false, paint),
-                    (10, false, paint),
-                    (11, false, paint),
                 ];
-                assert_eq!(
-                    sent, cleanups,
-                    "a refresh at the trigger and a key four triggers in, each with its burst"
-                );
+                assert_eq!(sent, cleanups, "a refresh at the trigger and its burst");
             } else {
                 assert_eq!(sent.len(), 16, "Turbo sends every frame");
                 assert_eq!(
@@ -3128,11 +3122,7 @@ mod tests {
                     sent[1..].iter().all(|r| r.2 == paint),
                     "the paint-over quality from the refresh on: {sent:?}"
                 );
-                assert_eq!(
-                    sent.iter().filter(|r| r.1).map(|r| r.0).collect::<Vec<_>>(),
-                    vec![8],
-                    "one key frame"
-                );
+                assert!(sent.iter().all(|r| !r.1), "no key frame: {sent:?}");
             }
         }
     }
@@ -3488,19 +3478,17 @@ mod tests {
             X11Pipeline::new(s.clone()).hw.is_some(),
             "VP9 runs as a full-frame session"
         );
-        for key in [false, true] {
-            let [still, moved] = cleanup_frame_that_moved(&s, key);
-            assert_eq!(
-                still,
-                [(Some(18), key); 2],
-                "a frame that stood still keeps it"
-            );
-            assert_eq!(
-                moved,
-                [(Some(18), key), (None, false)],
-                "a frame that moved does not"
-            );
-        }
+        let [still, moved] = cleanup_frame_that_moved(&s, false);
+        assert_eq!(
+            still,
+            [(Some(18), false); 2],
+            "a frame that stood still keeps it"
+        );
+        assert_eq!(
+            moved,
+            [(Some(18), false), (None, false)],
+            "a frame that moved does not"
+        );
     }
 
     /// The striped path decides each stripe's cleanup inside its encode (`encode_cpu`), so a
