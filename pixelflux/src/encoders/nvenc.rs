@@ -872,6 +872,10 @@ fn set_cbr_rate(rc: &mut NV_ENC_RC_PARAMS, bps: u32, vbv: u32) {
     rc.vbvInitialDelay = vbv;
 }
 
+/// The share of its cap a held band taken back for coming out past it is coded again to, at the
+/// bytes a block of it came to (`NvencEncoder::cap`): the next rows of a page can be denser.
+const REFIT_SHARE: f64 = 0.8;
+
 /// Fill `map`, the QP delta map of a `width` x `height` picture of `codec` (one entry a 16x16
 /// macroblock for H.264, a 32x32 coding tree block for HEVC, a 64x64 superblock for AV1, in
 /// raster order), with `delta` over the blocks the share of the picture `from..to` covers,
@@ -1645,6 +1649,10 @@ pub struct NvencEncoder {
     held_qp: Option<u32>,
     held_band: Option<(f64, f64)>,
     hold_refused: bool,
+    /// The bytes the next frame may come to (`cap`), and where the last was taken back for coming
+    /// out past them and coded again, how far its held band then reached, or 0 (`refit`).
+    cap: Option<usize>,
+    refit: Option<f64>,
     /// Bytes of the last held frame, and the QP delta map a held band is coded through.
     held_bytes: usize,
     qp_map: Vec<i8>,
@@ -2683,6 +2691,8 @@ impl NvencEncoder {
                 current_qp: codec.hardware_quantizer(Hardware::Nvenc, settings.video_crf),
                 held_qp: None,
                 held_band: None,
+                cap: None,
+                refit: None,
                 hold_refused: false,
                 held_bytes: 0,
                 qp_map: Vec::new(),
@@ -3457,6 +3467,21 @@ impl NvencEncoder {
         self.held_band = band.filter(|_| self.band_size().is_some());
     }
 
+    /// Take the next frame back where it comes out past `bytes` and code it again within them: a
+    /// held band in a shorter one, to `REFIT_SHARE` of them at the bytes the band came to, and a
+    /// frame of the rate control's at the coarsest quantizer, which on a still screen refines
+    /// nothing. The frame taken back is left out of the predictions as a frame a client lost is
+    /// (`retract_last`); a key frame stands as coded.
+    pub fn cap(&mut self, bytes: usize) {
+        self.cap = Some(bytes);
+    }
+
+    /// Where the last frame was taken back and coded again (`cap`): how far its held band then
+    /// reached, or 0 for a frame of the rate control's.
+    pub fn refit(&self) -> Option<f64> {
+        self.refit
+    }
+
     /// The bytes of the last held frame (0 before one), where the session holds a band: H.264,
     /// HEVC and AV1, whose QP delta map is one entry a macroblock, a 32x32 coding tree block, or a
     /// 64x64 superblock.
@@ -3767,6 +3792,54 @@ impl NvencEncoder {
                 true,
                 anchor,
             );
+        }
+        self.refit = None;
+        let cap = self.cap.take();
+        let mut held = held;
+        if let (Some(cap), Ok(coded), None, false) = (cap, &result, retry, force_idr)
+            && coded.len() > cap
+        {
+            let refit = match (held_qp, band, held) {
+                (Some(crf), Some((from, to)), Some(_)) => {
+                    let q = self.codec.hardware_quantizer(Hardware::Nvenc, crf as i32);
+                    let rest = self
+                        .codec
+                        .quantizer_max()
+                        .min(q + i8::MIN.unsigned_abs() as u32);
+                    let end = from + (to - from) * REFIT_SHARE * cap as f64 / coded.len() as f64;
+                    fill_band_map(
+                        &mut self.qp_map,
+                        self.codec,
+                        self.width,
+                        self.height,
+                        (from, end),
+                        q as i32 - rest as i32,
+                    );
+                    pic_params.qpDeltaMap = self.qp_map.as_mut_ptr();
+                    Some(end)
+                }
+                (None, _, None) => {
+                    held = self.hold_rate(self.codec.quantizer_max(), false);
+                    held.map(|_| 0.0)
+                }
+                _ => None,
+            };
+            if let Some(end) = refit
+                && self.retract_last()
+            {
+                pic_params.inputTimeStamp = self
+                    .references
+                    .as_ref()
+                    .map_or(0, ReferenceWindow::next_pts);
+                result = self.encode_picture(
+                    &mut pic_params,
+                    output_bitstream,
+                    frame_number,
+                    true,
+                    anchor,
+                );
+                self.refit = Some(end);
+            }
         }
         if let Some(rc) = held {
             self.encode_config.rcParams = rc;
@@ -5668,6 +5741,72 @@ mod gpu_tests {
                 if kbps == 1000 {
                     assert_eq!(coded, 1, "{codec:?}: a frame under the limit stands");
                 }
+            }
+        }
+    }
+
+    /// A cleanup frame that comes out past its cap (`cap`) is taken back and coded again: a held
+    /// band in a shorter one, which `refit` reports, and a frame of the rate control's at the
+    /// coarsest quantizer, refining nothing. The frame sent in place of the attempt predicts from
+    /// the one before it, and the stream decodes as one without the attempt; a frame within its
+    /// cap stands. Ignored by default.
+    #[test]
+    #[ignore]
+    fn gpu_a_cleanup_frame_past_its_cap_is_coded_again() {
+        use crate::encoders::reference::Reference;
+        use crate::webcam::decode::{Decoder as _, VideoDecoder};
+        let (w, h) = (1280usize, 720usize);
+        let still = frame(w, h, 10);
+        for codec in [Codec::H264, Codec::H265, Codec::Av1] {
+            let mut s = settings(w as i32, h as i32, 60.0);
+            s.codec = codec;
+            s.omit_stripe_headers = true;
+            s.video_cbr_mode = true;
+            s.video_bitrate_kbps = 2000;
+            let mut enc = match host_session(&s) {
+                Ok(enc) => enc,
+                Err(e) => {
+                    println!("{codec:?}: {e}");
+                    continue;
+                }
+            };
+            let encode = |enc: &mut NvencEncoder, i: u64| {
+                enc.encode_cpu_argb(&still, w * 4, i, 25, i == 0)
+                    .expect("encode")
+            };
+            let mut frames: Vec<_> = (0..4).map(|i| encode(&mut enc, i)).collect();
+            if enc.last_reference() == Reference::Untracked {
+                println!("{codec:?}: this device cannot invalidate a reference");
+                continue;
+            }
+            enc.hold_quantizer(10, Some((0.0, 0.5)));
+            enc.cap(4000);
+            frames.push(encode(&mut enc, 4));
+            let end = enc.refit().expect("the band taken back");
+            println!(
+                "{codec:?}: a band to 0.5 coded again to {end:.3}, {} bytes",
+                frames[4].len()
+            );
+            assert!(end > 0.0 && end < 0.5, "{codec:?}: {end}");
+            assert_eq!(enc.last_reference(), Reference::Frame(3), "{codec:?}");
+            enc.cap(1);
+            frames.push(encode(&mut enc, 5));
+            assert_eq!(
+                enc.refit(),
+                Some(0.0),
+                "{codec:?}: the rate control's frame taken back"
+            );
+            assert_eq!(enc.last_reference(), Reference::Frame(4), "{codec:?}");
+            enc.cap(usize::MAX);
+            frames.push(encode(&mut enc, 6));
+            assert_eq!(
+                enc.refit(),
+                None,
+                "{codec:?}: a frame within its cap stands"
+            );
+            let mut decoder = VideoDecoder::new(codec).unwrap();
+            for (i, f) in frames.iter().enumerate() {
+                assert!(decoder.decode(f).expect("decode"), "{codec:?} frame {i}");
             }
         }
     }

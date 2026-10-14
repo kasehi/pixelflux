@@ -377,6 +377,10 @@ pub struct RustCaptureSettings {
     /// the software x264 session at a peak of `video_bitrate_kbps` with this buffer, and `<= 0`
     /// leaves it uncapped.
     pub video_vbv_multiplier: f64,
+    /// The rate the path a stream crosses carries, as its transport measures it, which a still
+    /// screen's constant-rate cleanup may run at (`pipeline::cleanup_rate`); 0 where none was
+    /// said, which keeps the cleanup to the session's rate. Live, through `update_link_rate`.
+    pub video_link_kbps: i32,
     /// Seconds between scheduled recovery keyframes; `<= 0` keeps the GOP infinite
     /// (IDRs only on demand: client join / reset, recorder connect).
     pub keyframe_interval_s: f64,
@@ -481,6 +485,7 @@ impl Default for RustCaptureSettings {
             video_cbr_mode: false,
             video_bitrate_kbps: 4000,
             video_vbv_multiplier: 0.0,
+            video_link_kbps: 0,
             keyframe_interval_s: 0.0,
             video_min_qp: 0,
             video_max_qp: 0,
@@ -646,6 +651,7 @@ pub(crate) fn extract_settings(settings: &Bound<'_, PyAny>) -> PyResult<RustCapt
             .ok()
             .and_then(|v| v.extract::<f64>().ok())
             .unwrap_or(0.0),
+        video_link_kbps: 0,
         keyframe_interval_s: settings
             .getattr("keyframe_interval_s")
             .ok()
@@ -892,6 +898,12 @@ pub enum ThreadCommand {
         bitrate_kbps: Option<i32>,
         vbv_multiplier: Option<f64>,
         fps: Option<f64>,
+    },
+    /// The rate the path one display's stream crosses carries
+    /// (`RustCaptureSettings::video_link_kbps`).
+    UpdateLinkRate {
+        display_id: u32,
+        link_kbps: i32,
     },
     /// Live per-frame tunables (quality / paint-over / streaming / cursor) for one
     /// display's capture, mirrored to its readback encode thread — no restart.
@@ -1293,6 +1305,8 @@ pub struct WlEncodeControls {
     bitrate_kbps: AtomicI32,
     vbv_mult_milli: AtomicI32,
     fps_bits: AtomicU64,
+    /// The rate the path carries (`RustCaptureSettings::video_link_kbps`), read every frame.
+    link_kbps: AtomicI32,
     force_idr: AtomicBool,
     reference_reports: Mutex<Vec<encoders::reference::ReferenceReport>>,
     /// Pending per-frame tunables for the encode thread (mutex, not atomics: one struct, set
@@ -1308,6 +1322,7 @@ impl WlEncodeControls {
             bitrate_kbps: AtomicI32::new(0),
             vbv_mult_milli: AtomicI32::new(0),
             fps_bits: AtomicU64::new(0),
+            link_kbps: AtomicI32::new(0),
             force_idr: AtomicBool::new(false),
             reference_reports: Mutex::new(Vec::new()),
             tunables_dirty: AtomicBool::new(false),
@@ -1503,6 +1518,7 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<FrameE
         {
             t.apply_to(&mut settings);
         }
+        settings.video_link_kbps = cfg.controls.link_kbps.load(Ordering::Relaxed);
         if cfg.controls.rate_dirty.swap(false, Ordering::Acquire) {
             settings.video_bitrate_kbps = cfg.controls.bitrate_kbps.load(Ordering::Relaxed);
             settings.video_vbv_multiplier =
@@ -2229,6 +2245,8 @@ fn bootstrap_readback_pool(
     );
     c.fps_bits
         .store(settings.target_fps.max(1.0).to_bits(), Ordering::Relaxed);
+    c.link_kbps
+        .store(settings.video_link_kbps, Ordering::Relaxed);
     let cfg = WlEncodeConfig {
         settings: settings.clone(),
         display_id,
@@ -6257,6 +6275,22 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                     cap.acknowledge_reference(frame_id, held);
                 }
             }
+            ThreadCommand::UpdateLinkRate {
+                display_id,
+                link_kbps,
+            } => {
+                if let Some(idx) = state.node_idx_for_id(display_id)
+                    && let Some(cap) = state.output_nodes[idx].capture.as_mut()
+                {
+                    cap.settings.video_link_kbps = link_kbps;
+                    cap.encode_controls
+                        .link_kbps
+                        .store(link_kbps, Ordering::Relaxed);
+                    if display_id == 0 {
+                        state.settings.video_link_kbps = link_kbps;
+                    }
+                }
+            }
             ThreadCommand::UpdateRate {
                 display_id,
                 bitrate_kbps,
@@ -7960,6 +7994,19 @@ fn wayland_update_rate(
     }
 }
 
+/// Forward the rate a display's path carries to the shared Wayland backend (no-op if none is
+/// running).
+fn wayland_update_link_rate(py: Python<'_>, display_id: u32, link_kbps: i32) {
+    if let Some(slot) = WAYLAND_BACKEND.get()
+        && let Some(be) = slot.lock().unwrap().as_ref()
+    {
+        let _ = be.bind(py).borrow().send(ThreadCommand::UpdateLinkRate {
+            display_id,
+            link_kbps,
+        });
+    }
+}
+
 /// Forward live per-frame tunables to the shared Wayland backend (no-op if none is running).
 fn wayland_update_tunables(py: Python<'_>, display_id: u32, t: LiveTunables) {
     if let Some(slot) = WAYLAND_BACKEND.get()
@@ -8717,6 +8764,26 @@ impl ScreenCapture {
                 }
             }
             2 => wayland_update_rate(py, did, Some(kbps), None, None),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Apply the rate (kbps) the path the stream crosses carries, as the transport measures it, which
+    /// a still screen's constant-rate cleanup may run at; 0 where the transport has no measure,
+    /// which keeps the cleanup to the stream's rate.
+    fn update_link_rate(&self, py: Python<'_>, kbps: i32) -> PyResult<()> {
+        let (backend, controls, did) = {
+            let st = self.inner.lock().unwrap();
+            (st.backend, st.x11_controls(), st.wl_display)
+        };
+        match backend {
+            0 | 1 => {
+                if let Some(c) = &controls {
+                    c.link_kbps.store(kbps, Ordering::Relaxed);
+                }
+            }
+            2 => wayland_update_link_rate(py, did, kbps),
             _ => {}
         }
         Ok(())

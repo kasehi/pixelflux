@@ -1087,6 +1087,7 @@ where
 
     while !controls.stop.load(Ordering::Relaxed) {
         let fps = f64::from_bits(controls.fps_bits.load(Ordering::Relaxed)).max(1.0);
+        gpu.settings.video_link_kbps = controls.link_kbps.load(Ordering::Relaxed);
         let frame_dur = Duration::from_secs_f64(1.0 / fps.max(1.0));
         let trigger = wait_for_frame(&gpu.x.conn, Some(&gpu.x.damage), &pace, frame_dur);
         let woke = Instant::now();

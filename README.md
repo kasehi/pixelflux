@@ -813,14 +813,17 @@ asked for.
 *   **Smart Bandwidth Management:**
     *   **Change Detection:** Encodes only changed stripes (Software/JPEG mode).
     *   **Paint-Over:** Cleans up a still screen once its content stops changing, even while
-        `video_streaming_mode` encodes every frame: a refresh at the paint-over quality, and after
-        a large change a key frame at it once the screen holds still. Under CRF the session moves
-        to the paint-over quality for them on every encoder that takes a quality from the caller.
-        Under CBR, NVENC and software H.264 are cleaned up through their rate control: the frames
-        keep flowing, each within its budget, until it codes the screen at the paint-over quality,
-        with no key frame, and only where NVENC's rate control stops short of it (a low rate for
-        the resolution) does NVENC refresh the screen at that quality, a band of it a frame, each
-        within the budget. libvpx's VP8, whose rate control leaves a still screen as it is,
+        `video_streaming_mode` encodes every frame: a refresh at the paint-over quality, and, at a
+        constant rate on an encoder that holds a quantizer, after a large change a key frame at it
+        once the screen holds still. Under CRF the session moves to the paint-over quality for the
+        refresh on every encoder that takes a quality from the caller. Under CBR, NVENC and
+        software H.264 are cleaned up through their rate control: the frames keep flowing, each
+        within its budget, until it codes the screen at the paint-over quality, with no key frame,
+        and only where NVENC's rate control stops refining short of it (a low rate for the
+        resolution) does NVENC refresh the screen at that quality, a band of it a frame. Those
+        bands run at the rate the path carries, which `update_link_rate(kbps)` says (four times the
+        stream's rate at most, and the stream's rate where it is not said), and no cleanup frame
+        comes to more than 200 ms of it: NVENC codes one that does again, smaller. libvpx's VP8, whose rate control leaves a still screen as it is,
         refreshes it the same way from the start of the cleanup where the rate leaves a band room
         in a frame (a bit a macroblock: 0.5 Mbit/s at 1080p60, 0.22 at 720p60), else in one held
         frame. Other encoders that hold a quantizer hold the cleanup frames at it; one that does

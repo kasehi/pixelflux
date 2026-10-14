@@ -1262,6 +1262,25 @@ impl FrameEncoder {
         }
     }
 
+    /// Take the next frame back where it comes out past `bytes` and code it again within them:
+    /// a band held at a quantizer (`hold_quantizer`) in a shorter band, a frame of the rate
+    /// control's at the coarsest quantizer, refining nothing. NVENC, which leaves the frame out of
+    /// the predictions as one a client lost, does; elsewhere the frame stands as coded.
+    pub fn cap(&mut self, bytes: usize) {
+        if let FrameEncoder::Nvenc(enc) = self {
+            enc.cap(bytes);
+        }
+    }
+
+    /// Where the last frame was taken back and coded again (`cap`): how far its held band then
+    /// reached, or 0 for a frame of the rate control's.
+    pub fn refit(&self) -> Option<f64> {
+        match self {
+            FrameEncoder::Nvenc(enc) => enc.refit(),
+            _ => None,
+        }
+    }
+
     /// The bytes of the last frame held at a quantizer (0 before one), where the session holds a
     /// band of a frame at it (`hold_quantizer`): NVENC's H.264, HEVC and AV1 sessions, through a
     /// QP delta map, and libvpx's VP8, through a region-of-interest map.

@@ -977,6 +977,7 @@ where
 
     while !controls.stop.load(Ordering::Relaxed) {
         let fps = f64::from_bits(controls.fps_bits.load(Ordering::Relaxed)).max(1.0);
+        gpu.settings.video_link_kbps = controls.link_kbps.load(Ordering::Relaxed);
         let frame_dur = Duration::from_secs_f64(1.0 / fps.max(1.0));
         let now = Instant::now();
         if now < next_frame {
@@ -1155,14 +1156,21 @@ where
                 band: gpu.encoder.band_size(),
                 measures: false,
                 psnr: None,
+                refit: gpu.encoder.refit(),
             },
         );
         let normal = gpu.settings.video_crf as u32;
         let mut extent = None;
-        if lags && frame.is_new && decision.send && decision.cleanup_quality(normal).is_some() {
+        if lags
+            && frame.is_new
+            && decision.send
+            && (decision.cleanup_quality(normal).is_some()
+                || decision.cap.is_some() && decision.hold_band.is_none())
+        {
             let d = hash(&mut gpu.encoder, &mut hashes);
             if d.is_motion() {
                 decision.hold_qp = None;
+                decision.cap = None;
                 decision.target_qp = normal;
                 decision.force_idr =
                     pending_force_idr || periodic_idr_due(&gpu.settings, frame_counter);
@@ -1174,6 +1182,9 @@ where
             let encode_start_ns = crate::wayland::host::now_ns();
             if let Some(q) = decision.hold_qp {
                 gpu.encoder.hold_quantizer(q, decision.hold_band);
+            }
+            if let Some(bytes) = decision.cap {
+                gpu.encoder.cap(bytes);
             }
             match gpu.encoder.encode_cuda_pitch(
                 frame.device_ptr,

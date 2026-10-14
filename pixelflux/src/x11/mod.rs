@@ -75,7 +75,8 @@ pub mod nvfbc;
 /// 2. **Rate control** (gated by `rate_dirty`): `bitrate_kbps`, `vbv_mult_milli` (the VBV frame-time
 ///    multiplier * 1000, held as an integer for atomics; `<= 0` selects the policy default), and
 ///    `fps_bits` (the target fps as `f64` bits, so a fractional rate reaches the encoders exactly,
-///    re-read every frame for dynamic pacing and rate control). These
+///    re-read every frame for dynamic pacing and rate control), and `link_kbps`, the rate the path
+///    carries (`RustCaptureSettings::video_link_kbps`), also re-read every frame. These
 ///    atomics always hold the CURRENT values, so a pipeline rebuild can carry live rates forward.
 /// 3. **Tunables** (gated by `tunables_dirty`): one `LiveTunables` struct behind `tunables`, set
 ///    rarely, carrying the per-frame quality knobs for the encode thread.
@@ -95,6 +96,7 @@ pub struct Controls {
     pub bitrate_kbps: AtomicI32,
     pub vbv_mult_milli: AtomicI32,
     pub fps_bits: AtomicU64,
+    pub link_kbps: AtomicI32,
     pub tunables_dirty: AtomicBool,
     pub tunables: Mutex<Option<crate::LiveTunables>>,
     pub capture_cursor: AtomicBool,
@@ -120,6 +122,7 @@ impl Controls {
             bitrate_kbps: AtomicI32::new(s.video_bitrate_kbps),
             vbv_mult_milli: AtomicI32::new((s.video_vbv_multiplier * 1000.0).round() as i32),
             fps_bits: AtomicU64::new(s.target_fps.max(1.0).to_bits()),
+            link_kbps: AtomicI32::new(s.video_link_kbps),
             tunables_dirty: AtomicBool::new(false),
             tunables: Mutex::new(None),
             capture_cursor: AtomicBool::new(s.capture_cursor),
@@ -953,6 +956,7 @@ fn encode_loop<F>(
 
         let buf = unsafe { std::slice::from_raw_parts(frame.ptr, frame.len) };
         let encode_start_ns = crate::wayland::host::now_ns();
+        pl.set_link_rate(controls.link_kbps.load(Ordering::Relaxed));
         let mut stripes = pl.process(buf, frame.stride);
         FrameTiming::stamp(&mut stripes, frame.captured_ns, encode_start_ns);
         controls.codec.store(pl.codec().id(), Ordering::Relaxed);

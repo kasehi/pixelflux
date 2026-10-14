@@ -64,11 +64,6 @@ const CONVERGED_SHARE: f64 = 0.25;
 /// as NVENC's does at 2 Mbit/s at 1080p.
 const STALL_TRIGGERS: u32 = 2;
 
-/// Trigger periods a constant-rate cleanup through the rate control has to converge before it
-/// falls back to a held refresh: at 8 Mbit/s NVENC converges on a 1080p screen of text within
-/// four, and where the rate is low for the resolution it crawls for seconds.
-const FALLBACK_TRIGGERS: u32 = 6;
-
 /// Seconds a constant-rate cleanup through the rate control flows at most.
 const CONVERGE_S: f64 = 10.0;
 
@@ -348,8 +343,10 @@ pub fn refresh_start(trigger: u32, converges: bool) -> u32 {
 /// change of its constant quality re-opens it on a key frame (`FrameEncoder::reopens_on_quality`),
 /// whether its constant-rate cleanup ends on a key frame (`FrameEncoder::cleans_up_with_key`),
 /// where it holds a band of a frame at that quantizer (`FrameEncoder::band_size`), the
-/// bytes of its last held frame, and, where it measures a frame's reconstruction against its
-/// source when asked (`FrameEncoder::measures`), the last measurement.
+/// bytes of its last held frame, where it measures a frame's reconstruction against its
+/// source when asked (`FrameEncoder::measures`), the last measurement, and where it took its last
+/// frame back for coming out past its cap and coded it again (`FrameEncoder::refit`), how far
+/// that frame's held band then reached, or 0 for a frame of its rate control's.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EncoderQuality {
     pub last: Option<u32>,
@@ -360,6 +357,7 @@ pub struct EncoderQuality {
     pub band: Option<usize>,
     pub measures: bool,
     pub psnr: Option<f32>,
+    pub refit: Option<f64>,
 }
 
 impl EncoderQuality {
@@ -374,6 +372,7 @@ impl EncoderQuality {
             band: encoder.band_size(),
             measures: encoder.measures(),
             psnr: encoder.last_psnr(),
+            refit: encoder.refit(),
         }
     }
 
@@ -427,9 +426,45 @@ const PLATEAU_TRIGGERS: u32 = 4;
 const PLATEAU_GAIN_DB: f32 = 0.05;
 const PLATEAU_CHECKS: u32 = 2;
 
+/// Seconds of a link at the cleanup's rate a cleanup's frame may take to cross it (`cleanup_cap`):
+/// the session's buffer at 8 fps, under the backpressure gate's allowance.
+const CLEANUP_FRAME_S: f64 = 0.2;
+
+/// The most a cleanup runs at, in multiples of the session's rate (`cleanup_rate`): a sweep at
+/// 8 fps and 500 kbps over a fast path codes bands of two to six budgets.
+const CLEANUP_RATE_MAX: i32 = 4;
+
 /// Bytes a frame of the constant-rate target, at `kbps` and `fps`.
 pub fn frame_budget(kbps: i32, fps: f64) -> f64 {
     kbps.max(1) as f64 * 125.0 / fps.max(1.0)
+}
+
+/// The bytes a constant-rate cleanup's frame may come to: the session's own buffer, what its rate
+/// control holds a frame to, or `CLEANUP_FRAME_S` of the cleanup's rate (`cleanup_rate`) where that
+/// is more. A still screen's frames past what the path carries queue on it, where congestion
+/// control reads them as the path falling behind; at 60 fps and 500 kbps NVENC's rate control
+/// refines a 1080p page a budget a frame, and now and then mispredicts one at fifty.
+fn cleanup_cap(settings: &RustCaptureSettings) -> usize {
+    let vbv = (crate::encoders::vbv_bits(
+        (settings.video_bitrate_kbps.max(1) as u32).saturating_mul(1000),
+        settings.target_fps,
+        settings.keyframe_interval_s,
+        settings.video_vbv_multiplier,
+    ) / 8) as usize;
+    vbv.max((cleanup_rate(settings) as f64 * 125.0 * CLEANUP_FRAME_S) as usize)
+}
+
+/// The rate (kbps) a constant-rate cleanup's sweep is paced to and its frames capped by: what the
+/// path carries (`RustCaptureSettings::video_link_kbps`), never under the session's rate nor over
+/// `CLEANUP_RATE_MAX` times it, and the session's rate where the path's is not known. A still
+/// screen's refresh at the paint-over quantizer is many seconds of a low rate (1080p text at
+/// 500 kbps, 20 s), which a path faster than the stream carries at once and one near its rate
+/// only at that rate.
+pub fn cleanup_rate(settings: &RustCaptureSettings) -> i32 {
+    let rate = settings.video_bitrate_kbps.max(1);
+    settings
+        .video_link_kbps
+        .clamp(rate, rate.saturating_mul(CLEANUP_RATE_MAX))
 }
 
 /// The share of the picture the next band of a sweep covers, after one of `size` whose held frame
@@ -515,6 +550,8 @@ pub struct HwFrameDecision {
     /// Whether the encoder is asked to measure this frame's reconstruction
     /// (`FrameEncoder::measure`).
     pub measure: bool,
+    /// The bytes a still screen's cleanup frame may come to (`FrameEncoder::cap`).
+    pub cap: Option<usize>,
 }
 
 impl HwFrameDecision {
@@ -531,6 +568,9 @@ impl HwFrameDecision {
     pub fn prepare(&self, encoder: &mut FrameEncoder) {
         if let Some(q) = self.hold_qp {
             encoder.hold_quantizer(q, self.hold_band);
+        }
+        if let Some(bytes) = self.cap {
+            encoder.cap(bytes);
         }
         if self.measure {
             encoder.measure();
@@ -607,12 +647,20 @@ fn refresh_quality(settings: &RustCaptureSettings, encoder: EncoderQuality, spen
 ///    (`convergence`), for `CONVERGE_S` at most. A frame held at the paint-over quantizer the
 ///    size of a whole refresh would otherwise queue for up to half a second on a link near the
 ///    stream's rate; the rate control reaches the same picture in about a second at the
-///    default rate with every frame within its budget. Only where it has not converged within
-///    `FALLBACK_TRIGGERS` periods, or stalls short of the paint-over quality (`STALL_TRIGGERS`
-///    periods of small frames at a coarser quantizer), as where the rate is low for the
-///    resolution, is the picture refreshed at `held_refresh_quality`, which ends the cleanup: a
-///    band a frame where the encoder holds one (`FIRST_BAND`, `BAND_BUDGETS`) until the sweep
-///    has covered it or motion ends it, else one held frame. A sweep whose rest would take it
+///    default rate with every frame within its budget. Only where it stops refining short of
+///    convergence, its finest quantizer standing or its frames small at a coarser one for
+///    `STALL_TRIGGERS` periods, as where the rate is low for the resolution, or a frame of it
+///    comes out past its cap (`cleanup_cap`), is the picture refreshed at
+///    `held_refresh_quality`, which ends the cleanup: a band a frame where the encoder holds one
+///    (`FIRST_BAND`, `BAND_BUDGETS`) until the sweep has covered it or motion ends it, else one
+///    held frame. The bands are sized to the rate the path carries (`cleanup_rate`) and kept to
+///    it, one past its budget waited out before the next, and each cleanup frame, the rate
+///    control's and the sweep's, is held to its cap: the encoder takes one back that comes out
+///    past it and codes it again, a band in a shorter one and the rate control's frame refining
+///    nothing (`FrameEncoder::cap`). At 8 fps and 500 kbps NVENC's rate control refines a 1080p
+///    page a quantizer step every two frames for seconds, each frame within a budget, and bands
+///    of three to five budgets queue on a link a quarter faster than the rate, where congestion
+///    control reads them as the path falling behind. A sweep whose rest would take it
 ///    past `REFINE_S` at its bands' pace, once they are sized to the budget, is coded a step
 ///    coarser a band until the pace fits, and ends where that reaches the rate control's own
 ///    quantizer: dense text at 0.1 and 0.25 Mbit/s never finished in 40 s at the paint-over
@@ -724,6 +772,7 @@ pub fn decide_hw_fullframe(
         hold_qp: None,
         hold_band: None,
         measure: false,
+        cap: None,
     };
     if damage.is_dirty() {
         if !converges || damage.is_motion() {
@@ -752,6 +801,9 @@ pub fn decide_hw_fullframe(
         } else if sweeps && cleanup == Cleanup::Refresh && !d.force_idr {
             sweep_refresh(st, &mut d);
         }
+        if converges && cleanup != Cleanup::None && !d.force_idr {
+            d.cap = Some(cleanup_cap(settings));
+        }
         if converges && (cleanup != Cleanup::None || (burst > 0 && recovery_idr)) {
             if (st.h264_burst_frames_remaining <= 0 && !st.settled) || recovery_idr {
                 st.h264_burst_frames_remaining = cleanup_frames(settings, encoder);
@@ -777,8 +829,23 @@ pub fn decide_hw_fullframe(
         }
         return d;
     }
-    if let Some((from, size)) = st.sweep {
-        let budget = frame_budget(settings.video_bitrate_kbps, settings.target_fps);
+    if let Some((mut from, mut size)) = st.sweep {
+        // A band the encoder took back for coming out past its cap covered only so far.
+        if let Some(end) = encoder.refit.filter(|&end| end > 0.0 && end < from) {
+            size -= from - end;
+            from = end;
+        }
+        // Bands are sized to the cleanup's rate and kept to it: a budget they ran past is waited
+        // out before the next.
+        let budget = frame_budget(cleanup_rate(settings), settings.target_fps);
+        let held = std::mem::take(&mut st.sweep_held).then(|| encoder.band.unwrap_or(0));
+        st.sweep_debt = (st.sweep_debt + held.unwrap_or(0) as f64 - budget).max(0.0);
+        if st.sweep_debt >= budget {
+            st.sweep = Some((from, size));
+            st.sweep_frames = st.sweep_frames.saturating_add(1);
+            d.send = settings.video_streaming_mode || is_animated;
+            return d;
+        }
         let size = band_share(size, encoder.band, budget);
         let to = (from + size).min(1.0);
         st.sweep_frames = st.sweep_frames.saturating_add(1);
@@ -795,9 +862,11 @@ pub fn decide_hw_fullframe(
             return d;
         }
         st.sweep = (to < 1.0).then_some((to, size));
+        st.sweep_held = true;
         d.send = true;
         d.hold_qp = Some(q);
         d.hold_band = Some((from, to));
+        d.cap = Some(cleanup_cap(settings));
         return d;
     }
     let budget = frame_budget(settings.video_bitrate_kbps, settings.target_fps);
@@ -839,8 +908,15 @@ pub fn decide_hw_fullframe(
         st.h264_burst_frames_remaining -= 1;
         d.send = true;
         d.hold_qp = (st.burst_held && improves).then_some(refresh_qp);
-        let elapsed = (converge_frames(settings) - st.h264_burst_frames_remaining).max(0) as u32;
         let stalled = st.idle_frames >= STALL_TRIGGERS * trigger;
+        if converges && let Some(q) = encoder.last {
+            if st.finest.is_none_or(|finest| q < finest) {
+                st.finest = Some(q);
+                st.finest_frames = 0;
+            } else {
+                st.finest_frames = st.finest_frames.saturating_add(1);
+            }
+        }
         if converges && !encoder.holds {
             let reached = settings.use_paint_over_quality && st.fine_frames >= trigger;
             let (measure, level) = plateau(st, encoder.psnr, PLATEAU_TRIGGERS * trigger);
@@ -857,14 +933,6 @@ pub fn decide_hw_fullframe(
             st.rc_bytes = bytes;
             let same = st.same_frames as f64 >= EMPTY_S * settings.target_fps
                 && encoder.last.is_some_and(|q| q >= SAME_FRAME_QUALITY);
-            if let Some(q) = encoder.last {
-                if st.finest.is_none_or(|finest| q < finest) {
-                    st.finest = Some(q);
-                    st.finest_frames = 0;
-                } else {
-                    st.finest_frames = st.finest_frames.saturating_add(1);
-                }
-            }
             let level = st.finest_frames as f64 >= LEVEL_S * settings.target_fps;
             if ((stalled || same || level) && !encoder.measures)
                 || done
@@ -875,7 +943,10 @@ pub fn decide_hw_fullframe(
             }
         } else if converges
             && improves
-            && (stalled || pinned || elapsed >= FALLBACK_TRIGGERS * trigger)
+            && (stalled
+                || pinned
+                || st.finest_frames >= STALL_TRIGGERS * trigger
+                || encoder.refit == Some(0.0))
         {
             d.hold_qp = Some(if pinned {
                 refresh_quality(
@@ -891,6 +962,9 @@ pub fn decide_hw_fullframe(
                 start_sweep(st, &mut d);
             }
         }
+        if converges {
+            d.cap = Some(cleanup_cap(settings));
+        }
         return d;
     }
     d.send = settings.video_streaming_mode || is_animated;
@@ -904,6 +978,8 @@ fn start_sweep(st: &mut StripeState, d: &mut HwFrameDecision) {
     st.sweep = Some((FIRST_BAND, FIRST_BAND));
     st.sweep_frames = 0;
     st.sweep_coarser = 0;
+    st.sweep_debt = 0.0;
+    st.sweep_held = true;
 }
 
 /// A refresh due on a session that sweeps it (`decide_hw_fullframe`'s `sweeps`): a sweep from the
@@ -983,6 +1059,7 @@ fn decide_constant_quality(
         hold_qp: None,
         hold_band: None,
         measure: false,
+        cap: None,
     };
     if recovery_idr && cleanup == Cleanup::None {
         d.target_qp = normal_qp;
@@ -1440,6 +1517,12 @@ impl X11Pipeline {
         }
     }
 
+    /// Take the rate the path carries (`RustCaptureSettings::video_link_kbps`), which the next
+    /// process() reads.
+    pub fn set_link_rate(&mut self, kbps: i32) {
+        self.settings.video_link_kbps = kbps;
+    }
+
     /// Apply live per-frame tunables (quality, paint-over, streaming mode, keyframe
     /// cadence); every encoder re-reads them from the settings on the next process().
     pub fn update_tunables(&mut self, t: &crate::LiveTunables) {
@@ -1497,11 +1580,11 @@ impl X11Pipeline {
                 quality,
             );
             // A Turbo frame is decided on the hash of the one before, so a frame coded whole at
-            // a cleanup's quality could carry a change it was not decided for, coded at that
-            // quality. Such a frame is hashed before it is encoded instead of beside it, and one
-            // that moved is coded as motion is: at the session's quality, and a key frame only
-            // where one is due. A held band needs none of this: the rest of its frame is held at
-            // the coarsest quantizer.
+            // a cleanup's quality, or capped and coded again at the coarsest, could carry a change
+            // it was not decided for, coded at that quality. Such a frame is hashed before it is
+            // encoded instead of beside it, and one that moved is coded as motion is: at the
+            // session's quality, uncapped, and a key frame only where one is due. A held band
+            // needs none of this: the rest of its frame is held at the coarsest quantizer.
             let normal = self.settings.video_crf as u32;
             #[cfg(test)]
             let decided = (d.cleanup_quality(normal), d.force_idr);
@@ -1509,7 +1592,7 @@ impl X11Pipeline {
             if turbo
                 && self.settings.use_paint_over_quality
                 && d.send
-                && d.cleanup_quality(normal).is_some()
+                && (d.cleanup_quality(normal).is_some() || d.cap.is_some() && d.hold_band.is_none())
             {
                 let dirty = hash_bands(
                     &mut self.bands,
@@ -1521,6 +1604,7 @@ impl X11Pipeline {
                 );
                 if band_damage(&dirty).is_motion() {
                     d.hold_qp = None;
+                    d.cap = None;
                     d.target_qp = normal;
                     d.force_idr = requested || periodic_idr_due(&self.settings, self.frame_counter);
                 }
@@ -1738,6 +1822,7 @@ mod tests {
         band: None,
         measures: false,
         psnr: None,
+        refit: None,
     };
 
     /// A settings block for the hardware full-frame policy: a constant rate, whose cleanup holds
@@ -1854,6 +1939,7 @@ mod tests {
             band: None,
             measures: false,
             psnr: None,
+            refit: None,
         };
         let mut st = StripeState::default();
         for i in 0..3u16 {
@@ -2075,8 +2161,9 @@ mod tests {
     fn a_constant_rate_cleanup_runs_through_a_rate_control_that_converges() {
         let s = hw_settings();
         let budget = frame_budget(s.video_bitrate_kbps, s.target_fps) as usize;
-        let refining = EncoderQuality {
-            last: Some(40),
+        let trigger = s.paint_over_trigger_frames as u16;
+        let refining = |i: u16| EncoderQuality {
+            last: Some(40 - u32::from(i / trigger)),
             bytes: Some(budget),
             holds: true,
             reopens: false,
@@ -2084,6 +2171,7 @@ mod tests {
             band: None,
             measures: false,
             psnr: None,
+            refit: None,
         };
         let converged = EncoderQuality {
             last: Some(8),
@@ -2094,13 +2182,13 @@ mod tests {
             band: None,
             measures: false,
             psnr: None,
+            refit: None,
         };
-        let trigger = s.paint_over_trigger_frames as u16;
-        let window = 1 + (FALLBACK_TRIGGERS as u16) * trigger;
+        let window = 1 + 6 * trigger;
         let mut st = StripeState::default();
-        decide_hw_fullframe(&mut st, &s, 0, Damage::Area(1.0), false, false, refining);
+        decide_hw_fullframe(&mut st, &s, 0, Damage::Area(1.0), false, false, refining(0));
         let still: Vec<HwFrameDecision> = (1..window)
-            .map(|i| decide_hw_fullframe(&mut st, &s, i, Damage::None, false, false, refining))
+            .map(|i| decide_hw_fullframe(&mut st, &s, i, Damage::None, false, false, refining(i)))
             .collect();
         assert!(
             still.iter().all(|d| d.hold_qp.is_none() && !d.force_idr),
@@ -2123,9 +2211,9 @@ mod tests {
     }
 
     /// A session that holds no quantizer has no refresh to fall back to: its cleanup flows
-    /// through the rate control past the window a holding one is given, and ends after a
-    /// trigger period of frames coded at the paint-over quantizer, whatever their size, or
-    /// once its finest quantizer has stood for `LEVEL_S`.
+    /// through the rate control past the periods of a level quantizer a holding one is given,
+    /// and ends after a trigger period of frames coded at the paint-over quantizer, whatever
+    /// their size, or once its finest quantizer has stood for `LEVEL_S`.
     #[test]
     fn a_session_that_holds_no_quantizer_is_refined_until_it_reaches_the_paint_over_quality() {
         let s = hw_settings();
@@ -2139,9 +2227,10 @@ mod tests {
             band: None,
             measures: false,
             psnr: None,
+            refit: None,
         };
         let trigger = s.paint_over_trigger_frames as u16;
-        let past = trigger + 2 * (FALLBACK_TRIGGERS as u16) * trigger;
+        let past = 13 * trigger;
         let mut st = StripeState::default();
         decide_hw_fullframe(&mut st, &s, 0, Damage::Area(1.0), false, false, at(40));
         let still: Vec<HwFrameDecision> = (1..past)
@@ -2212,6 +2301,7 @@ mod tests {
             band: None,
             measures: false,
             psnr: None,
+            refit: None,
         };
         let trigger = s.paint_over_trigger_frames;
         let mut st = StripeState::default();
@@ -2250,6 +2340,7 @@ mod tests {
             band: None,
             measures: false,
             psnr: None,
+            refit: None,
         };
         let mut st = StripeState::default();
         decide_hw_fullframe(&mut st, &s, 0, Damage::Area(1.0), false, false, crawling);
@@ -2266,9 +2357,9 @@ mod tests {
         assert_eq!(held.len(), 1, "{held:?}");
         let trigger = s.paint_over_trigger_frames as usize;
         assert_eq!(
-            held[0] + 1,
-            1 + (FALLBACK_TRIGGERS as usize) * trigger,
-            "after the window"
+            held[0],
+            1 + (STALL_TRIGGERS as usize) * trigger,
+            "once its quantizer has stood"
         );
         assert_eq!(
             still[held[0]].hold_qp,
@@ -2297,6 +2388,7 @@ mod tests {
             band: Some(0),
             measures: false,
             psnr: None,
+            refit: None,
         };
         let mut st = StripeState::default();
         decide_hw_fullframe(&mut st, &s, 0, Damage::Area(1.0), false, false, pinned);
@@ -2342,6 +2434,7 @@ mod tests {
             band: Some(0),
             measures: false,
             psnr: None,
+            refit: None,
         };
         let mut st = StripeState::default();
         decide_hw_fullframe(&mut st, &s, 0, Damage::Area(1.0), false, false, pinned);
@@ -2392,6 +2485,7 @@ mod tests {
             band: None,
             measures: false,
             psnr: None,
+            refit: None,
         };
         let mut st = StripeState::default();
         decide_hw_fullframe(&mut st, &s, 0, Damage::Area(1.0), false, false, crawling);
@@ -2412,7 +2506,7 @@ mod tests {
             .position(|d| d.hold_qp.is_some())
             .expect("a held refresh") as u16
             + 1;
-        let bound = trigger * (LOW_MOTION_TRIGGERS + 2 * FALLBACK_TRIGGERS) as u16 * 3 / 2;
+        let bound = trigger * (LOW_MOTION_TRIGGERS + 2 * STALL_TRIGGERS) as u16 * 3 / 2;
         assert!(
             first <= bound,
             "the caret does not hold it off: {first} > {bound}"
@@ -2437,6 +2531,7 @@ mod tests {
             band: None,
             measures: false,
             psnr: None,
+            refit: None,
         };
         let mut st = StripeState::default();
         decide_hw_fullframe(&mut st, &s, 0, Damage::Area(1.0), false, false, idle);
@@ -2462,7 +2557,10 @@ mod tests {
 
     #[test]
     fn a_stalled_rate_control_that_holds_a_band_sweeps_the_picture_within_the_budget() {
-        let s = hw_settings();
+        let s = RustCaptureSettings {
+            video_link_kbps: hw_settings().video_bitrate_kbps,
+            ..hw_settings()
+        };
         let budget = frame_budget(s.video_bitrate_kbps, s.target_fps);
         let idle = |held: usize| EncoderQuality {
             last: Some(38),
@@ -2473,6 +2571,7 @@ mod tests {
             band: Some(held),
             measures: false,
             psnr: None,
+            refit: None,
         };
         let mut st = StripeState::default();
         decide_hw_fullframe(&mut st, &s, 0, Damage::Area(1.0), false, false, idle(0));
@@ -2514,6 +2613,172 @@ mod tests {
         assert_eq!(sent_after, 0, "which ends the cleanup");
     }
 
+    /// A cleanup runs at what the path carries, never under the session's rate nor over
+    /// `CLEANUP_RATE_MAX` times it, and at the session's rate where the path is not known; its
+    /// sweep keeps to that rate, a band past its budget waited out before the next.
+    #[test]
+    fn a_sweep_keeps_to_the_rate_the_path_carries() {
+        let at = |link: i32| RustCaptureSettings {
+            video_link_kbps: link,
+            ..hw_settings()
+        };
+        let rate = hw_settings().video_bitrate_kbps;
+        assert_eq!(cleanup_rate(&at(0)), rate);
+        assert_eq!(cleanup_rate(&at(rate / 2)), rate);
+        assert_eq!(cleanup_rate(&at(rate * 2)), rate * 2);
+        assert_eq!(cleanup_rate(&at(rate * 100)), rate * CLEANUP_RATE_MAX);
+        let s = at(rate);
+        let budget = frame_budget(rate, s.target_fps);
+        let over = |held: usize| EncoderQuality {
+            last: Some(38),
+            bytes: Some(budget as usize / 10),
+            holds: true,
+            reopens: false,
+            keys: true,
+            band: Some(held),
+            measures: false,
+            psnr: None,
+            refit: None,
+        };
+        let mut st = StripeState::default();
+        decide_hw_fullframe(&mut st, &s, 0, Damage::Area(1.0), false, false, over(0));
+        let sent: Vec<bool> = (1..=400u16)
+            .map(|i| {
+                let d = decide_hw_fullframe(
+                    &mut st,
+                    &s,
+                    i,
+                    Damage::None,
+                    false,
+                    false,
+                    over(3 * budget as usize),
+                );
+                d.hold_band.is_some()
+            })
+            .collect();
+        let first = sent.iter().position(|&b| b).expect("a sweep");
+        let bands: Vec<usize> = sent[first..]
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| **b)
+            .map(|(i, _)| i)
+            .collect();
+        assert!(bands.len() > 3, "{bands:?}");
+        assert!(
+            bands[1..].windows(2).all(|w| w[1] - w[0] == 3),
+            "a band of three budgets every third frame: {bands:?}"
+        );
+    }
+
+    /// Every frame of a constant-rate cleanup, the rate control's and the sweep's, carries a cap,
+    /// the session's buffer or `CLEANUP_FRAME_S` of the cleanup's rate; motion and a key frame
+    /// carry none. A frame of the rate control's taken back for coming out past it starts the
+    /// sweep on the next frame, and a band taken back resumes where it ended, so the bands still
+    /// cover the picture.
+    #[test]
+    fn a_cleanup_frame_past_its_cap_is_taken_back() {
+        let s = hw_settings();
+        let budget = frame_budget(s.video_bitrate_kbps, s.target_fps);
+        let cap = Some(cleanup_cap(&s));
+        let link = cleanup_rate(&s) as f64 * 125.0 * CLEANUP_FRAME_S;
+        assert!(
+            (cleanup_cap(&s) as f64 - link.max(budget * 1.5)).abs() <= 1.0,
+            "{cap:?}"
+        );
+        let rc = |last: u32, held: usize, refit: Option<f64>| EncoderQuality {
+            last: Some(last),
+            bytes: Some(budget as usize),
+            holds: true,
+            reopens: false,
+            keys: true,
+            band: Some(held),
+            measures: false,
+            psnr: None,
+            refit,
+        };
+        let mut st = StripeState::default();
+        let moving = decide_hw_fullframe(
+            &mut st,
+            &s,
+            0,
+            Damage::Area(1.0),
+            false,
+            false,
+            rc(40, 0, None),
+        );
+        assert_eq!(moving.cap, None, "motion carries no cap");
+        let first =
+            decide_hw_fullframe(&mut st, &s, 1, Damage::None, false, false, rc(40, 0, None));
+        assert!(first.send && first.hold_qp.is_none() && first.cap == cap);
+        let next = decide_hw_fullframe(&mut st, &s, 2, Damage::None, false, false, rc(39, 0, None));
+        assert!(next.send && next.hold_band.is_none() && next.cap == cap);
+        let swept = decide_hw_fullframe(
+            &mut st,
+            &s,
+            3,
+            Damage::None,
+            false,
+            false,
+            rc(38, 0, Some(0.0)),
+        );
+        assert_eq!(
+            swept.hold_band,
+            Some((0.0, FIRST_BAND)),
+            "the frame taken back starts the sweep"
+        );
+        assert_eq!(swept.cap, cap);
+        let mut bands = vec![(0.0, FIRST_BAND)];
+        for i in 4..=400u16 {
+            let (a, b) = *bands.last().unwrap();
+            let (held, refit) = if bands.len() == 3 {
+                (budget as usize, Some(a + (b - a) / 4.0))
+            } else {
+                (((b - a) * 128.0 * budget) as usize, None)
+            };
+            let d = decide_hw_fullframe(
+                &mut st,
+                &s,
+                i,
+                Damage::None,
+                false,
+                false,
+                rc(38, held, refit),
+            );
+            let Some(band) = d.hold_band else {
+                if st.sweep.is_none() {
+                    break;
+                }
+                continue;
+            };
+            assert_eq!(d.cap, cap);
+            if let Some(end) = refit {
+                assert_eq!(band.0, end, "a band taken back resumes where it ended");
+                bands.last_mut().unwrap().1 = end;
+            }
+            bands.push(band);
+        }
+        assert!(
+            bands.windows(2).all(|w| w[0].1 == w[1].0),
+            "contiguous bands: {bands:?}"
+        );
+        assert_eq!(bands.last().unwrap().1, 1.0, "that cover the picture");
+        let mut st = StripeState::default();
+        decide_hw_fullframe(
+            &mut st,
+            &s,
+            0,
+            Damage::Area(1.0),
+            false,
+            false,
+            rc(40, 0, None),
+        );
+        let key = decide_hw_fullframe(&mut st, &s, 1, Damage::None, false, true, rc(40, 0, None));
+        assert!(
+            key.force_idr && key.cap.is_none(),
+            "a key frame carries none"
+        );
+    }
+
     /// A session that holds its refresh rather than converging to it, and holds a band of a frame
     /// (libvpx's VP8), sweeps that refresh a band a frame from the top, each a budget, until it
     /// covers the picture, with no whole held frame; a caret blinking meanwhile leaves the sweep
@@ -2531,6 +2796,7 @@ mod tests {
             band: Some(held),
             measures: false,
             psnr: None,
+            refit: None,
         };
         let mut st = StripeState::default();
         decide_hw_fullframe(&mut st, &s, 0, Damage::Area(1.0), false, false, vp8(0));
@@ -2584,6 +2850,7 @@ mod tests {
             band: Some(held),
             measures: false,
             psnr: None,
+            refit: None,
         };
         let refresh = held_refresh_quality(&s, idle(0));
         let mut st = StripeState::default();
@@ -2635,6 +2902,7 @@ mod tests {
             band: None,
             measures: false,
             psnr: None,
+            refit: None,
         };
         let mut st = StripeState::default();
         decide_hw_fullframe(&mut st, &s, 0, Damage::Area(1.0), false, false, level);
@@ -2664,6 +2932,7 @@ mod tests {
             band: Some(budget),
             measures: false,
             psnr: None,
+            refit: None,
         };
         let mut st = StripeState::default();
         decide_hw_fullframe(&mut st, &s, 0, Damage::Area(1.0), false, false, idle);
@@ -2701,8 +2970,8 @@ mod tests {
     fn a_recovery_key_frame_is_refined_until_the_rate_control_converges() {
         let s = hw_settings();
         let budget = frame_budget(s.video_bitrate_kbps, s.target_fps) as usize;
-        let coarse = EncoderQuality {
-            last: Some(40),
+        let coarse = |i: u16| EncoderQuality {
+            last: Some(40 - u32::from(i - 201)),
             bytes: Some(budget),
             holds: true,
             reopens: false,
@@ -2710,6 +2979,7 @@ mod tests {
             band: None,
             measures: false,
             psnr: None,
+            refit: None,
         };
         let clean = EncoderQuality {
             last: Some(8),
@@ -2720,6 +2990,7 @@ mod tests {
             band: None,
             measures: false,
             psnr: None,
+            refit: None,
         };
         let mut st = StripeState::default();
         assert!(
@@ -2739,7 +3010,7 @@ mod tests {
         let past_burst = 201 + s.video_paintover_burst_frames as u16 + 3;
         assert!(
             (201..past_burst).all(|i| {
-                let d = decide_hw_fullframe(&mut st, &s, i, Damage::None, false, false, coarse);
+                let d = decide_hw_fullframe(&mut st, &s, i, Damage::None, false, false, coarse(i));
                 d.send && !d.force_idr && d.hold_qp.is_none()
             }),
             "the rate control keeps refining the key frame past the configured burst"
@@ -2765,6 +3036,7 @@ mod tests {
             band: None,
             measures: false,
             psnr: None,
+            refit: None,
         };
         let coarse = EncoderQuality {
             last: Some(40),
@@ -2775,6 +3047,7 @@ mod tests {
             band: None,
             measures: false,
             psnr: None,
+            refit: None,
         };
         let mut st = StripeState::default();
         let mut frame = 0u16;
@@ -2969,6 +3242,7 @@ mod tests {
             band: None,
             measures: false,
             psnr: None,
+            refit: None,
         };
         let mut st = StripeState::default();
         decide_hw_fullframe(&mut st, &cbr, 1, Damage::Area(1.0), false, false, coarse);
@@ -3048,6 +3322,7 @@ mod tests {
                         band: None,
                         measures: false,
                         psnr: None,
+                        refit: None,
                     },
                 );
                 if i > 0 && d.send {
@@ -3142,6 +3417,7 @@ mod tests {
             band: None,
             measures: false,
             psnr: None,
+            refit: None,
         };
         let mut st = StripeState::default();
         for i in 0..3u16 {
@@ -3760,6 +4036,7 @@ mod tests {
                     band: None,
                     measures: false,
                     psnr: None,
+                    refit: None,
                 },
             )
         };
