@@ -1061,9 +1061,10 @@ impl H264EncoderWrapper {
 ///   of small frames short of the paint-over quality, of empty ones for x264), `same_frames` (of
 ///   frames the size of the one before), `finest` and `finest_frames` (the finest quality index
 ///   its rate control has coded at and the frames since), and `over_frames` (its run of frames over
-///   `pipeline::OVERSHOOT_BUDGETS`) tell a cleanup that runs through the rate control when it has
-///   converged, stalled, or been pinned at its coarsest quantizer, `fine_frames` counts its run of
-///   frames at the paint-over quantizer or finer, `measured`, `measuring`, `level_checks`, and
+///   `pipeline::OVERSHOOT_BUDGETS` and no finer than `finest`) tell a cleanup that runs through
+///   the rate control when it has converged, stalled, or been pinned at its coarsest quantizer,
+///   `fine_frames` counts its run of frames at the paint-over quantizer or finer, `measured`,
+///   `measuring`, `level_checks`, and
 ///   `measure_in` are the last measurement of the picture it is refining, whether the frame before
 ///   was measured, the measurements in a row that found it level, and the frames to the next
 ///   (`pipeline::plateau`), `settled` records

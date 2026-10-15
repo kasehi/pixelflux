@@ -667,8 +667,9 @@ fn refresh_quality(settings: &RustCaptureSettings, encoder: EncoderQuality, spen
 ///    one. At 2 Mbit/s at 1080p a key frame
 ///    capped to `HELD_KEY_BUDGET_S` of the target came out coarser than the picture it cleaned
 ///    (35.9 dB), where the refresh reached 44.2. A rate control whose frames of the still screen
-///    run over `OVERSHOOT_BUDGETS` for a trigger period is pinned at its coarsest quantizer and
-///    refines nothing within the rate, and every frame of a sweep would carry the rest of the
+///    run over `OVERSHOOT_BUDGETS` for a trigger period, none finer than the finest before (the
+///    frames refining a recovery key frame run as far over), is pinned at its coarsest quantizer
+///    and refines nothing within the rate, and every frame of a sweep would carry the rest of the
 ///    picture at that cost: NVENC's at 0.1 Mbit/s codes a still 1080p screen of texture in
 ///    16-budget frames, and its sweep sent 4.7 MB in 40 s without ending. Such a screen is
 ///    refreshed at once in one held frame, coarsened to what `HELD_KEY_BUDGET_S` buys at those
@@ -872,9 +873,15 @@ pub fn decide_hw_fullframe(
     let budget = frame_budget(settings.video_bitrate_kbps, settings.target_fps);
     let trigger = settings.paint_over_trigger();
     if converges && st.h264_burst_frames_remaining > 0 {
+        // Only a frame no finer than the burst's finest refines nothing: after a recovery key frame
+        // coded at the coarsest quantizer, the rate control's frames run as far over their budgets
+        // while it refines the picture from it.
         st.over_frames = if encoder
             .bytes
             .is_some_and(|b| b as f64 > budget * OVERSHOOT_BUDGETS)
+            && encoder
+                .last
+                .is_none_or(|q| st.finest.is_none_or(|finest| q >= finest))
         {
             st.over_frames.saturating_add(1)
         } else {
@@ -2605,6 +2612,77 @@ mod tests {
             .send),
             "and no more"
         );
+    }
+
+    /// A key frame asked for on a clean still screen comes out at the coarsest quantizer, and the
+    /// rate control's frames after it run over their budgets while they refine it: the cleanup
+    /// carries on into the band sweep, not the one refresh at that quantizer a rate control
+    /// pinned at its coarsest gets (NVENC at 0.5 Mbit/s, 8 fps, 1080p text: 25.7 dB for good).
+    #[test]
+    fn a_rate_control_refining_a_recovery_key_frame_is_not_pinned() {
+        let s = RustCaptureSettings {
+            video_bitrate_kbps: 500,
+            target_fps: 8.0,
+            video_paintover_crf: 18,
+            paint_over_trigger_frames: 15,
+            ..hw_settings()
+        };
+        let budget = frame_budget(s.video_bitrate_kbps, s.target_fps);
+        let rc = |last: u32, budgets: f64, refit: Option<f64>| EncoderQuality {
+            last: Some(last),
+            bytes: Some((budget * budgets) as usize),
+            holds: true,
+            reopens: false,
+            keys: true,
+            band: Some(700),
+            measures: false,
+            psnr: None,
+            refit,
+        };
+        let mut st = StripeState {
+            paint_over_sent: true,
+            no_motion_frame_count: 100,
+            ..Default::default()
+        };
+        let key = decide_hw_fullframe(&mut st, &s, 0, Damage::None, false, true, rc(42, 0.1, None));
+        assert!(key.send && key.force_idr);
+        let after = decide_hw_fullframe(
+            &mut st,
+            &s,
+            1,
+            Damage::None,
+            false,
+            false,
+            rc(51, 4.3, None),
+        );
+        assert!(
+            after.send && after.hold_qp.is_none(),
+            "the burst through the rate control"
+        );
+        let refit = decide_hw_fullframe(
+            &mut st,
+            &s,
+            2,
+            Damage::None,
+            false,
+            false,
+            rc(43, 7.5, Some(0.0)),
+        );
+        assert_eq!(
+            (refit.hold_qp, refit.hold_band),
+            (Some(25), Some((0.0, FIRST_BAND))),
+            "a frame taken back for its cap starts the sweep, refreshed from its quantizer"
+        );
+        let band = decide_hw_fullframe(
+            &mut st,
+            &s,
+            3,
+            Damage::None,
+            false,
+            false,
+            rc(43, 0.1, None),
+        );
+        assert!(band.send && band.hold_band.is_some_and(|(from, _)| from == FIRST_BAND));
     }
 
     #[test]
