@@ -1128,13 +1128,13 @@ where
         // client. As on the XShm path, a new frame coded whole at a cleanup's quality is hashed
         // first instead, and one that moved is coded as motion is; a held band codes the rest of
         // its frame at the coarsest quantizer, so a change there costs one coarse frame. Only the
-        // paint-over's cleanup reads the extent, so without it nothing is hashed.
-        let lags = gpu.settings.video_streaming_mode && gpu.settings.use_paint_over_quality;
+        // cleanup reads the extent, so without one nothing is hashed.
+        let lags = gpu.settings.video_streaming_mode && gpu.settings.cleans_up();
         let damage = if lags {
             std::mem::replace(&mut lagged, Damage::None)
         } else if !frame.is_new {
             Damage::None
-        } else if gpu.settings.video_streaming_mode || !gpu.settings.use_paint_over_quality {
+        } else if gpu.settings.video_streaming_mode || !gpu.settings.cleans_up() {
             hashes.clear();
             Damage::Unknown
         } else {

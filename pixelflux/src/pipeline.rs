@@ -526,8 +526,8 @@ fn cleanup_frames(settings: &RustCaptureSettings, encoder: EncoderQuality) -> i3
 /// burst, which it refines; a key frame there would come out at the rate control's quantizer,
 /// which a small buffer starves.
 pub fn paint_over_improves(settings: &RustCaptureSettings, encoder: EncoderQuality) -> bool {
-    let paint = settings.video_paintover_crf.max(0) as u32;
-    settings.use_paint_over_quality
+    let paint = settings.cleanup_crf().max(0) as u32;
+    settings.cleans_up()
         && if settings.video_cbr_mode {
             encoder.last.is_none_or(|q| q > paint)
         } else {
@@ -614,7 +614,7 @@ pub fn held_refresh_quality(settings: &RustCaptureSettings, encoder: EncoderQual
 /// one: a rate control pinned at its coarsest quantizer (`OVERSHOOT_BUDGETS`) refreshed in one
 /// held frame, which then costs that much more.
 fn refresh_quality(settings: &RustCaptureSettings, encoder: EncoderQuality, spent: f64) -> u32 {
-    let paint = settings.video_paintover_crf.max(0) as u32;
+    let paint = settings.cleanup_crf().max(0) as u32;
     match (settings.video_cbr_mode, encoder.last) {
         (true, Some(last)) => {
             let frames = (crate::encoders::HELD_KEY_BUDGET_S * settings.target_fps
@@ -741,7 +741,7 @@ pub fn decide_hw_fullframe(
         );
     }
     let normal_qp = settings.video_crf as u32;
-    let paint_qp = settings.video_paintover_crf as u32;
+    let paint_qp = settings.cleanup_crf() as u32;
     let burst = settings.video_paintover_burst_frames;
     let improves = paint_over_improves(settings, encoder);
     let recovery_idr = requested_idr || periodic_idr_due(settings, frame_counter);
@@ -918,7 +918,7 @@ pub fn decide_hw_fullframe(
             }
         }
         if converges && !encoder.holds {
-            let reached = settings.use_paint_over_quality && st.fine_frames >= trigger;
+            let reached = settings.cleans_up() && st.fine_frames >= trigger;
             let (measure, level) = plateau(st, encoder.psnr, PLATEAU_TRIGGERS * trigger);
             d.measure = measure;
             let done = if encoder.measures { level } else { reached };
@@ -1674,7 +1674,7 @@ impl X11Pipeline {
             let decided = (d.cleanup_quality(normal), d.force_idr);
             let mut hashed = None;
             let on_device = turbo
-                && self.settings.use_paint_over_quality
+                && self.settings.cleans_up()
                 && d.send
                 && self
                     .hw
@@ -1682,7 +1682,7 @@ impl X11Pipeline {
                     .unwrap()
                     .hash_next_upload(DAMAGE_BAND_ROWS as u32);
             if turbo
-                && self.settings.use_paint_over_quality
+                && self.settings.cleans_up()
                 && d.send
                 && (d.cleanup_quality(normal).is_some() || d.cap.is_some() && d.hold_band.is_none())
             {
@@ -1718,7 +1718,7 @@ impl X11Pipeline {
                 // A Turbo paint-over reads the bands the frame before changed: hashed on the
                 // device where NVENC uploads the frame, beside its encode, else on a thread
                 // beside it (`hash_beside`).
-                let beside = hashed.is_none() && turbo && self.settings.use_paint_over_quality;
+                let beside = hashed.is_none() && turbo && self.settings.cleans_up();
                 let mut encode = || {
                     if d.send {
                         enc.encode_host(argb, stride, false, fc, d.target_qp, force_idr)
@@ -1817,7 +1817,7 @@ impl X11Pipeline {
                 // As a full frame above: a frame that codes a stripe at the paint-over quality
                 // while it holds still is hashed before it is encoded, and decided on its own
                 // change as well as the one before.
-                let hashed = (self.settings.use_paint_over_quality
+                let hashed = (self.settings.cleans_up()
                     && stripes_held_still(&self.stripes, &self.settings))
                 .then(|| {
                     hash_bands(
@@ -1863,7 +1863,7 @@ impl X11Pipeline {
                 if let Some(dirty) = hashed {
                     self.turbo_dirty = dirty;
                     encode()
-                } else if self.settings.use_paint_over_quality {
+                } else if self.settings.cleans_up() {
                     let (out, dirty) = hash_beside(
                         &mut self.bands,
                         argb,
@@ -2548,12 +2548,14 @@ mod tests {
         );
     }
 
-    /// A key frame asked for on a still screen with the paint-over off opens a burst through the
-    /// rate control, which ends at once where the rate control is pinned at its coarsest quantizer.
+    /// A key frame asked for on a still screen with nothing for a cleanup to improve (the session
+    /// asks for no finer than the coarsest quantizer) opens a burst through the rate control,
+    /// which ends at once where the rate control is pinned at its coarsest quantizer.
     #[test]
     fn a_pinned_rate_control_ends_a_recovery_burst() {
         let s = RustCaptureSettings {
             video_bitrate_kbps: 100,
+            video_crf: 51,
             use_paint_over_quality: false,
             ..hw_settings()
         };
@@ -3400,8 +3402,9 @@ mod tests {
     /// session's, through the session's quality, whatever the encoder holds. At a constant rate
     /// it applies where the paint-over quality is finer than what the rate control last coded
     /// at, or the encoder does not say: held where the encoder holds a quantizer, and otherwise a
-    /// refresh and its burst at the rate control's own quality, never a key frame. Never with
-    /// paint-over off.
+    /// refresh and its burst at the rate control's own quality, never a key frame. With the
+    /// paint-over off a constant rate still cleans up, to the session's own quality (25 here),
+    /// and a constant quality does not.
     #[test]
     fn the_cleanup_follows_the_rate_control_and_the_switch() {
         #[derive(Debug, PartialEq)]
@@ -3423,7 +3426,10 @@ mod tests {
             (false, 18, true, None, true, Seen::Session),
             (false, 18, true, None, false, Seen::Session),
             (false, 18, false, None, true, Seen::Nothing),
-            (true, 18, false, None, true, Seen::Nothing),
+            (true, 18, false, None, true, Seen::Held),
+            (true, 18, false, Some(30), true, Seen::Held),
+            (true, 18, false, Some(20), true, Seen::Nothing),
+            (true, 18, false, Some(30), false, Seen::Unheld),
         ] {
             let s = RustCaptureSettings {
                 video_cbr_mode: cbr,
@@ -3463,7 +3469,11 @@ mod tests {
                         !cbr || holds || !d.force_idr,
                         "a key frame where no quantizer is held: last={last:?}"
                     );
-                    if d.hold_qp.is_some() {
+                    if let Some(q) = d.hold_qp {
+                        assert!(
+                            q >= s.cleanup_crf() as u32,
+                            "held finer than the cleanup's {q}"
+                        );
                         got = Seen::Held;
                     } else if d.target_qp != s.video_crf as u32 {
                         assert!(!cbr, "a constant rate keeps its session quality");
@@ -4134,17 +4144,22 @@ mod tests {
         assert!(held > 0, "no cleanup ran");
     }
 
-    /// With no motion, no request, and paint-over off, nothing is emitted at any frame-counter
-    /// position: the GOP is infinite, so there is no scheduled IDR to break the silence.
+    /// With no motion, no request, and nothing for a cleanup to improve (the rate control codes
+    /// at the session's quality), nothing is emitted at any frame-counter position: the GOP is
+    /// infinite, so there is no scheduled IDR to break the silence.
     #[test]
     fn static_frames_stay_silent_without_request() {
         let s = RustCaptureSettings {
             use_paint_over_quality: false,
             ..hw_settings()
         };
+        let clean = EncoderQuality {
+            last: Some(s.video_crf as u32),
+            ..HOLDS
+        };
         let mut st = StripeState::default();
         for fc in [0u16, 1, 120, 240] {
-            let d = decide_hw_fullframe(&mut st, &s, fc, Damage::None, false, false, HOLDS);
+            let d = decide_hw_fullframe(&mut st, &s, fc, Damage::None, false, false, clean);
             assert!(!d.send && !d.force_idr, "frame {fc} should stay idle");
         }
     }

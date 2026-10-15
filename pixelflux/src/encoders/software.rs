@@ -1679,8 +1679,12 @@ pub fn encode_cpu(
             } else {
                 0
             };
-            if crate::pipeline::convergence(quality.last, bytes, video_po_crf.max(0) as u32, budget)
-                == crate::pipeline::Convergence::Converged
+            if crate::pipeline::convergence(
+                quality.last,
+                bytes,
+                settings.cleanup_crf().max(0) as u32,
+                budget,
+            ) == crate::pipeline::Convergence::Converged
                 || stripe_state.idle_frames as f64 >= crate::pipeline::EMPTY_S * target_fps
             {
                 stripe_state.h264_burst_frames_remaining = 0;

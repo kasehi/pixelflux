@@ -286,7 +286,7 @@ settings.omit_stripe_headers = False
 # --- Change Detection & Optimization ---
 settings.video_min_qp = 0                          # CBR QP clamps: 0 = encoder default; max bounds the quality floor, min bounds bit waste on easy content
 settings.video_max_qp = 0
-settings.use_paint_over_quality = True  # Clean up a still screen at the paint-over quality, whatever video_streaming_mode sends
+settings.use_paint_over_quality = True  # Clean up a still screen at the paint-over quality, whatever video_streaming_mode sends (CBR video cleans up without it too, at video_crf)
 settings.paint_over_trigger_frames = 15 # Frames without change before a held cleanup, counted at 60 fps (a lower frame rate waits as long; a cleanup through the rate control starts on the first still frame; a screen changing only in small places gets it after four times this)
 settings.damage_block_threshold = 10    # Consecutive changes to trigger "damaged" state
 settings.damage_block_duration = 30     # Frames a stripe stays "damaged"
@@ -816,7 +816,10 @@ asked for.
         `video_streaming_mode` encodes every frame: a refresh at the paint-over quality, and, at a
         constant rate on an encoder that holds a quantizer, after a large change a key frame at it
         once the screen holds still. Under CRF the session moves to the paint-over quality for the
-        refresh on every encoder that takes a quality from the caller. Under CBR, NVENC and
+        refresh on every encoder that takes a quality from the caller. A constant-rate video
+        stream is cleaned up with the paint-over off too, to the session's own quality
+        (`video_crf`) rather than the paint-over's: a rate control alone stops short of a clean
+        picture where the rate is low for the frame rate. Under CBR, NVENC and
         software H.264 are cleaned up through their rate control: the frames keep flowing, each
         within its budget, until it codes the screen at the paint-over quality, with no key frame,
         and only where NVENC's rate control stops refining short of it (a low rate for the

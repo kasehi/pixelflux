@@ -514,7 +514,7 @@ pub fn paint_over_desc(
     fixed: Option<&str>,
     holds: bool,
 ) -> Option<String> {
-    if !settings.use_paint_over_quality {
+    if !settings.cleans_up() {
         return None;
     }
     if !settings.codec.is_video() {
@@ -534,13 +534,16 @@ pub fn paint_over_desc(
     } else {
         return None;
     };
-    Some(if at_paint_over {
-        format!(
-            "PaintOver CRF: {} (Burst: {burst}f)",
-            settings.video_paintover_crf
-        )
+    // A constant rate cleans up without the paint-over too, to the session's own quality.
+    let what = if settings.use_paint_over_quality {
+        "PaintOver"
     } else {
-        format!("PaintOver Burst: {burst}f")
+        "Cleanup"
+    };
+    Some(if at_paint_over {
+        format!("{what} CRF: {} (Burst: {burst}f)", settings.cleanup_crf())
+    } else {
+        format!("{what} Burst: {burst}f")
     })
 }
 
@@ -633,16 +636,18 @@ mod tests {
             ),
             None
         );
+        // A constant rate cleans up without the paint-over too, to the session's quality.
+        let cbr_off = RustCaptureSettings {
+            use_paint_over_quality: false,
+            ..cbr.clone()
+        };
         assert_eq!(
-            paint_over_desc(
-                &RustCaptureSettings {
-                    use_paint_over_quality: false,
-                    ..cbr.clone()
-                },
-                None,
-                false
-            ),
-            None
+            paint_over_desc(&cbr_off, None, false).as_deref(),
+            Some("Cleanup Burst: 5f")
+        );
+        assert_eq!(
+            paint_over_desc(&cbr_off, None, true),
+            Some(format!("Cleanup CRF: {} (Burst: 5f)", cbr_off.video_crf))
         );
         assert_eq!(
             paint_over_desc(
