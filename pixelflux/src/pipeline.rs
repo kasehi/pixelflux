@@ -601,11 +601,14 @@ pub fn periodic_idr_due(settings: &RustCaptureSettings, frame_counter: u16) -> b
     (frame_counter as u64).is_multiple_of(interval)
 }
 
-/// The quality index a held refresh (a predicted frame) is coded at: the paint-over one, or,
-/// where a constant rate last coded far coarser, as much finer than that as
+/// The quality index a refresh held in one frame (a predicted frame) is coded at: the paint-over
+/// one, or, where a constant rate last coded far coarser, as much finer than that as
 /// `HELD_KEY_BUDGET_S` of the target allows at six steps a doubling, since a refresh of a whole
 /// screen at the paint-over quantizer after heavy motion at a low rate would cost many frames of
-/// budget at once.
+/// budget at once. The bands of the sweep a cleanup through the rate control falls back to, each
+/// sized to a frame's budget, are coded at the paint-over quantizer instead: counted from the rate
+/// control's last quantizer, which a key frame after a loss leaves at the coarsest, the sweep
+/// ended up to 13 dB short of it at 8 fps.
 pub fn held_refresh_quality(settings: &RustCaptureSettings, encoder: EncoderQuality) -> u32 {
     refresh_quality(settings, encoder, 1.0)
 }
@@ -650,10 +653,10 @@ fn refresh_quality(settings: &RustCaptureSettings, encoder: EncoderQuality, spen
 ///    default rate with every frame within its budget. Only where it stops refining short of
 ///    convergence, its finest quantizer standing or its frames small at a coarser one for
 ///    `STALL_TRIGGERS` periods, as where the rate is low for the resolution, or a frame of it
-///    comes out past its cap (`cleanup_cap`), is the picture refreshed at
-///    `held_refresh_quality`, which ends the cleanup: a band a frame where the encoder holds one
-///    (`FIRST_BAND`, `BAND_BUDGETS`) until the sweep has covered it or motion ends it, else one
-///    held frame. The bands are sized to the rate the path carries (`cleanup_rate`) and kept to
+///    comes out past its cap (`cleanup_cap`), is the picture refreshed, which ends the cleanup: a
+///    band a frame at the paint-over quantizer where the encoder holds one (`FIRST_BAND`,
+///    `BAND_BUDGETS`) until the sweep has covered it or motion ends it, else one held frame at
+///    `held_refresh_quality`. The bands are sized to the rate the path carries (`cleanup_rate`) and kept to
 ///    it, one past its budget waited out before the next, and each cleanup frame, the rate
 ///    control's and the sweep's, is held to its cap: the encoder takes one back that comes out
 ///    past it and codes it again, a band in a shorter one and the rate control's frame refining
@@ -761,6 +764,9 @@ pub fn decide_hw_fullframe(
         damage,
     );
     let refresh_qp = held_refresh_quality(settings, encoder);
+    // The bands of the sweep a cleanup through the rate control falls back to, each sized to a
+    // frame's budget, are coded at the paint-over quantizer (`held_refresh_quality`).
+    let band_qp = if converges { paint_qp } else { refresh_qp };
     let cleanup_qp = match cleanup {
         Cleanup::Refresh if holds => Some(refresh_qp),
         Cleanup::Key => Some(paint_qp),
@@ -789,7 +795,7 @@ pub fn decide_hw_fullframe(
         d.force_idr = recovery_idr || cleanup == Cleanup::Key;
         d.hold_qp = cleanup_qp;
         if sweeps && cleanup == Cleanup::Refresh && !d.force_idr {
-            sweep_refresh(st, &mut d);
+            sweep_refresh(st, &mut d, band_qp);
         }
         return d;
     }
@@ -800,7 +806,7 @@ pub fn decide_hw_fullframe(
         if recovery_idr {
             st.sweep = None;
         } else if sweeps && cleanup == Cleanup::Refresh && !d.force_idr {
-            sweep_refresh(st, &mut d);
+            sweep_refresh(st, &mut d, band_qp);
         }
         if converges && cleanup != Cleanup::None && !d.force_idr {
             d.cap = Some(cleanup_cap(settings));
@@ -857,7 +863,7 @@ pub fn decide_hw_fullframe(
         if paced && (1.0 - to) / size > left.max(1.0) {
             st.sweep_coarser += 1;
         }
-        let q = refresh_qp + st.sweep_coarser;
+        let q = band_qp + st.sweep_coarser;
         if encoder.last.is_some_and(|last| q >= last) {
             st.sweep = None;
             return d;
@@ -966,7 +972,7 @@ pub fn decide_hw_fullframe(
             });
             st.h264_burst_frames_remaining = 0;
             if encoder.band.is_some() && !pinned {
-                start_sweep(st, &mut d);
+                start_sweep(st, &mut d, band_qp);
             }
         }
         if converges {
@@ -978,9 +984,10 @@ pub fn decide_hw_fullframe(
     d
 }
 
-/// Start a refresh sweep at the top of the picture: its first band in this frame, the rest a band
-/// a frame after it (`FIRST_BAND`, `band_share`).
-fn start_sweep(st: &mut StripeState, d: &mut HwFrameDecision) {
+/// Start a refresh sweep at the top of the picture: its first band in this frame at `qp`, the rest
+/// a band a frame after it (`FIRST_BAND`, `band_share`).
+fn start_sweep(st: &mut StripeState, d: &mut HwFrameDecision, qp: u32) {
+    d.hold_qp = Some(qp);
     d.hold_band = Some((0.0, FIRST_BAND));
     st.sweep = Some((FIRST_BAND, FIRST_BAND));
     st.sweep_frames = 0;
@@ -993,11 +1000,11 @@ fn start_sweep(st: &mut StripeState, d: &mut HwFrameDecision) {
 /// top, or, with one under way, which is already refreshing the picture, nothing held, the frame
 /// going at the rate control's quality: a sweep started over at every change of a blinking caret
 /// would never cover the picture, and a whole held frame is what the sweep spreads.
-fn sweep_refresh(st: &mut StripeState, d: &mut HwFrameDecision) {
+fn sweep_refresh(st: &mut StripeState, d: &mut HwFrameDecision, qp: u32) {
     if st.sweep.is_some() {
         d.hold_qp = None;
     } else {
-        start_sweep(st, d);
+        start_sweep(st, d, qp);
     }
 }
 
@@ -2617,7 +2624,9 @@ mod tests {
     /// A key frame asked for on a clean still screen comes out at the coarsest quantizer, and the
     /// rate control's frames after it run over their budgets while they refine it: the cleanup
     /// carries on into the band sweep, not the one refresh at that quantizer a rate control
-    /// pinned at its coarsest gets (NVENC at 0.5 Mbit/s, 8 fps, 1080p text: 25.7 dB for good).
+    /// pinned at its coarsest gets (NVENC at 0.5 Mbit/s, 8 fps, 1080p text: 25.7 dB for good),
+    /// and the sweep's bands are coded at the paint-over quantizer, not one counted from the rate
+    /// control's (at 8 fps, 18 steps under it: 25 here, 33 from the key frame's 51).
     #[test]
     fn a_rate_control_refining_a_recovery_key_frame_is_not_pinned() {
         let s = RustCaptureSettings {
@@ -2670,8 +2679,8 @@ mod tests {
         );
         assert_eq!(
             (refit.hold_qp, refit.hold_band),
-            (Some(25), Some((0.0, FIRST_BAND))),
-            "a frame taken back for its cap starts the sweep, refreshed from its quantizer"
+            (Some(18), Some((0.0, FIRST_BAND))),
+            "a frame taken back for its cap starts the sweep, at the paint-over quantizer"
         );
         let band = decide_hw_fullframe(
             &mut st,
@@ -2682,7 +2691,12 @@ mod tests {
             false,
             rc(43, 0.1, None),
         );
-        assert!(band.send && band.hold_band.is_some_and(|(from, _)| from == FIRST_BAND));
+        assert!(
+            band.send
+                && band.hold_qp == Some(18)
+                && band.hold_band.is_some_and(|(from, _)| from == FIRST_BAND),
+            "and so is the next band"
+        );
     }
 
     #[test]
