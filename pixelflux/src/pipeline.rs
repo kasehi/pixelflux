@@ -801,8 +801,9 @@ pub fn decide_hw_fullframe(
     }
     if cleanup != Cleanup::None || recovery_idr {
         // A key frame asked for codes a clean region again at the stream's own quality: it is due
-        // its cleanup again, as after a loss, a trigger period on.
-        if recovery_idr && cleanup == Cleanup::None {
+        // its cleanup again, as after a loss, a trigger period on. A periodic one is not: a cleanup
+        // each interval would cost a held key frame each interval where the cleanup keys.
+        if requested_idr && cleanup == Cleanup::None {
             st.lost_frame();
         }
         d.send = true;

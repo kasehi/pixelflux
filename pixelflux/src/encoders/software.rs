@@ -1415,6 +1415,7 @@ pub fn encode_cpu(
     force_idr_all: bool,
 ) -> Vec<EncodedStripe> {
     let codec = settings.codec;
+    let asked_idr = force_idr_all && !crate::pipeline::periodic_idr_due(settings, frame_counter);
     let n_processing_stripes = stripe_count(height, codec, settings.video_fullframe);
 
     if stripes.len() != n_processing_stripes {
@@ -1645,8 +1646,8 @@ pub fn encode_cpu(
         let mut quality_or_crf = if !video { jpeg_q } else { video_crf };
         let mut force_idr = video && (force_idr_all || cleanup == Cleanup::Key);
         // A key frame asked for codes a clean stripe again at its rate control's quality: it is due
-        // its cleanup again, as after a loss, a trigger period on.
-        if force_idr_all && video && cleanup == Cleanup::None {
+        // its cleanup again, as after a loss, a trigger period on (`pipeline::decide_hw_fullframe`).
+        if asked_idr && video && cleanup == Cleanup::None {
             stripe_state.lost_frame();
         }
         let mut hold = None;
