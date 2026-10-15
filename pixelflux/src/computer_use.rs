@@ -1276,6 +1276,8 @@ const MAX_CU_BODY: usize = 4 * 1024 * 1024;
 const MAX_CU_PENDING: usize = 16;
 /// How long a connection has to send its request.
 const CU_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a refused request's connection is read on after its answer (`cu_refuse`).
+const CU_LINGER: Duration = Duration::from_secs(1);
 
 /// Read one HTTP/1.1 request: `(stream, path, body)` for an authorized one; anything
 /// else is answered here (401, 4xx) or dropped, before more than its head is read.
@@ -1289,7 +1291,7 @@ fn read_cu_request(mut stream: TcpStream) -> Option<(TcpStream, String, String)>
             break i;
         }
         if buf.len() > MAX_CU_HEAD {
-            cu_respond(&mut stream, 431, "{\"error\":\"request head too large\"}");
+            cu_refuse(&mut stream, 431, "{\"error\":\"request head too large\"}");
             return None;
         }
         let n = stream.read(&mut chunk).ok()?;
@@ -1316,11 +1318,11 @@ fn read_cu_request(mut stream: TcpStream) -> Option<(TcpStream, String, String)>
         }
     }
     if !authorized(authorization) {
-        cu_respond(&mut stream, 401, "{\"error\":\"unauthorized\"}");
+        cu_refuse(&mut stream, 401, "{\"error\":\"unauthorized\"}");
         return None;
     }
     let Some(length) = length.filter(|_| !chunked) else {
-        cu_respond(
+        cu_refuse(
             &mut stream,
             411,
             "{\"error\":\"a Content-Length is required\"}",
@@ -1328,7 +1330,7 @@ fn read_cu_request(mut stream: TcpStream) -> Option<(TcpStream, String, String)>
         return None;
     };
     if length > MAX_CU_BODY {
-        cu_respond(&mut stream, 413, "{\"error\":\"request body too large\"}");
+        cu_refuse(&mut stream, 413, "{\"error\":\"request body too large\"}");
         return None;
     }
     let mut body = buf.split_off(head_end + 4);
@@ -1341,13 +1343,30 @@ fn read_cu_request(mut stream: TcpStream) -> Option<(TcpStream, String, String)>
     match String::from_utf8(body) {
         Ok(body) => Some((stream, path, body)),
         Err(_) => {
-            cu_respond(&mut stream, 400, "{\"error\":\"body is not UTF-8\"}");
+            cu_refuse(&mut stream, 400, "{\"error\":\"body is not UTF-8\"}");
             None
         }
     }
 }
 
 /// Answer a request with a JSON body and close the connection.
+/// Answer a request refused before all of it was read, then read on and drop what the client
+/// still sends, for `CU_LINGER` and `MAX_CU_BODY` at most, before the connection is dropped: a
+/// socket closed with unread data resets the connection, which can cut the answer short.
+fn cu_refuse(stream: &mut TcpStream, status: u16, json: &str) {
+    cu_respond(stream, status, json);
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let _ = stream.set_read_timeout(Some(CU_LINGER));
+    let deadline = std::time::Instant::now() + CU_LINGER;
+    let (mut sink, mut drained) = ([0u8; 4096], 0usize);
+    while drained < MAX_CU_BODY && std::time::Instant::now() < deadline {
+        match stream.read(&mut sink) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => drained += n,
+        }
+    }
+}
+
 fn cu_respond(stream: &mut TcpStream, status: u16, json: &str) {
     let reason = match status {
         200 => "OK",
