@@ -534,16 +534,13 @@ pub fn paint_over_desc(
     } else {
         return None;
     };
-    // A constant rate cleans up without the paint-over too, to the session's own quality.
-    let what = if settings.use_paint_over_quality {
-        "PaintOver"
-    } else {
-        "Cleanup"
-    };
     Some(if at_paint_over {
-        format!("{what} CRF: {} (Burst: {burst}f)", settings.cleanup_crf())
+        format!(
+            "PaintOver CRF: {} (Burst: {burst}f)",
+            settings.video_paintover_crf
+        )
     } else {
-        format!("{what} Burst: {burst}f")
+        format!("PaintOver Burst: {burst}f")
     })
 }
 
@@ -636,18 +633,18 @@ mod tests {
             ),
             None
         );
-        // A constant rate cleans up without the paint-over too, to the session's quality.
+        // A constant rate cleans up with the paint-over off too, to the same quality.
         let cbr_off = RustCaptureSettings {
             use_paint_over_quality: false,
             ..cbr.clone()
         };
         assert_eq!(
-            paint_over_desc(&cbr_off, None, false).as_deref(),
-            Some("Cleanup Burst: 5f")
+            paint_over_desc(&cbr_off, None, false),
+            paint_over_desc(&cbr, None, false)
         );
         assert_eq!(
             paint_over_desc(&cbr_off, None, true),
-            Some(format!("Cleanup CRF: {} (Burst: 5f)", cbr_off.video_crf))
+            paint_over_desc(&cbr, None, true)
         );
         assert_eq!(
             paint_over_desc(

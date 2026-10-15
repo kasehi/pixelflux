@@ -499,19 +499,11 @@ const TRIGGER_FPS: f64 = 60.0;
 impl RustCaptureSettings {
     /// Whether a still screen is cleaned up (`pipeline::cleanup_due`): a constant-rate video
     /// stream always, whose rate control alone stops short of a clean picture where the rate is
-    /// low for the frame rate; otherwise only with the paint-over on.
+    /// low for the frame rate, to the paint-over quality (`video_paintover_crf`), the finest a
+    /// still screen is refined to, as fast as its path carries; otherwise only with the
+    /// paint-over on.
     pub fn cleans_up(&self) -> bool {
         self.use_paint_over_quality || (self.video_cbr_mode && self.codec.is_video())
-    }
-
-    /// The quality index a video stream's cleanup refines a still screen to: the paint-over's
-    /// where it is on, else the session's own.
-    pub fn cleanup_crf(&self) -> i32 {
-        if self.use_paint_over_quality {
-            self.video_paintover_crf
-        } else {
-            self.video_crf
-        }
     }
 
     /// `paint_over_trigger_frames` at the session's frame rate: below `TRIGGER_FPS` the same

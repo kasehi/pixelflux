@@ -1683,7 +1683,7 @@ pub fn encode_cpu(
             if crate::pipeline::convergence(
                 quality.last,
                 bytes,
-                settings.cleanup_crf().max(0) as u32,
+                settings.video_paintover_crf.max(0) as u32,
                 budget,
             ) == crate::pipeline::Convergence::Converged
                 || stripe_state.idle_frames as f64 >= crate::pipeline::EMPTY_S * target_fps

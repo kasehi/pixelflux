@@ -817,9 +817,10 @@ asked for.
         constant rate on an encoder that holds a quantizer, after a large change a key frame at it
         once the screen holds still. Under CRF the session moves to the paint-over quality for the
         refresh on every encoder that takes a quality from the caller. A constant-rate video
-        stream is cleaned up with the paint-over off too, to the session's own quality
-        (`video_crf`) rather than the paint-over's: a rate control alone stops short of a clean
-        picture where the rate is low for the frame rate. Under CBR, NVENC and
+        stream is cleaned up the same with the paint-over off: a rate control alone stops short
+        of a clean picture where the rate is low for the frame rate, and the paint-over quality
+        is the finest a still screen is refined to, reached as fast as its path carries
+        (`video_crf` plays no part under CBR). Under CBR, NVENC and
         software H.264 are cleaned up through their rate control: the frames keep flowing, each
         within its budget, until it codes the screen at the paint-over quality, with no key frame,
         and only where NVENC's rate control stops refining short of it (a low rate for the

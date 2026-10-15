@@ -526,7 +526,7 @@ fn cleanup_frames(settings: &RustCaptureSettings, encoder: EncoderQuality) -> i3
 /// burst, which it refines; a key frame there would come out at the rate control's quantizer,
 /// which a small buffer starves.
 pub fn paint_over_improves(settings: &RustCaptureSettings, encoder: EncoderQuality) -> bool {
-    let paint = settings.cleanup_crf().max(0) as u32;
+    let paint = settings.video_paintover_crf.max(0) as u32;
     settings.cleans_up()
         && if settings.video_cbr_mode {
             encoder.last.is_none_or(|q| q > paint)
@@ -617,7 +617,7 @@ pub fn held_refresh_quality(settings: &RustCaptureSettings, encoder: EncoderQual
 /// one: a rate control pinned at its coarsest quantizer (`OVERSHOOT_BUDGETS`) refreshed in one
 /// held frame, which then costs that much more.
 fn refresh_quality(settings: &RustCaptureSettings, encoder: EncoderQuality, spent: f64) -> u32 {
-    let paint = settings.cleanup_crf().max(0) as u32;
+    let paint = settings.video_paintover_crf.max(0) as u32;
     match (settings.video_cbr_mode, encoder.last) {
         (true, Some(last)) => {
             let frames = (crate::encoders::HELD_KEY_BUDGET_S * settings.target_fps
@@ -745,7 +745,7 @@ pub fn decide_hw_fullframe(
         );
     }
     let normal_qp = settings.video_crf as u32;
-    let paint_qp = settings.cleanup_crf() as u32;
+    let paint_qp = settings.video_paintover_crf as u32;
     let burst = settings.video_paintover_burst_frames;
     let improves = paint_over_improves(settings, encoder);
     let recovery_idr = requested_idr || periodic_idr_due(settings, frame_counter);
@@ -2569,7 +2569,7 @@ mod tests {
     fn a_pinned_rate_control_ends_a_recovery_burst() {
         let s = RustCaptureSettings {
             video_bitrate_kbps: 100,
-            video_crf: 51,
+            video_paintover_crf: 51,
             use_paint_over_quality: false,
             ..hw_settings()
         };
@@ -3495,8 +3495,8 @@ mod tests {
     /// it applies where the paint-over quality is finer than what the rate control last coded
     /// at, or the encoder does not say: held where the encoder holds a quantizer, and otherwise a
     /// refresh and its burst at the rate control's own quality, never a key frame. With the
-    /// paint-over off a constant rate still cleans up, to the session's own quality (25 here),
-    /// and a constant quality does not.
+    /// paint-over off a constant rate cleans up alike, to the paint-over quality, and a constant
+    /// quality does not.
     #[test]
     fn the_cleanup_follows_the_rate_control_and_the_switch() {
         #[derive(Debug, PartialEq)]
@@ -3520,7 +3520,8 @@ mod tests {
             (false, 18, false, None, true, Seen::Nothing),
             (true, 18, false, None, true, Seen::Held),
             (true, 18, false, Some(30), true, Seen::Held),
-            (true, 18, false, Some(20), true, Seen::Nothing),
+            (true, 18, false, Some(20), true, Seen::Held),
+            (true, 18, false, Some(18), true, Seen::Nothing),
             (true, 18, false, Some(30), false, Seen::Unheld),
         ] {
             let s = RustCaptureSettings {
@@ -3563,7 +3564,7 @@ mod tests {
                     );
                     if let Some(q) = d.hold_qp {
                         assert!(
-                            q >= s.cleanup_crf() as u32,
+                            q >= s.video_paintover_crf as u32,
                             "held finer than the cleanup's {q}"
                         );
                         got = Seen::Held;
@@ -4237,7 +4238,7 @@ mod tests {
     }
 
     /// With no motion, no request, and nothing for a cleanup to improve (the rate control codes
-    /// at the session's quality), nothing is emitted at any frame-counter position: the GOP is
+    /// at the paint-over quality), nothing is emitted at any frame-counter position: the GOP is
     /// infinite, so there is no scheduled IDR to break the silence.
     #[test]
     fn static_frames_stay_silent_without_request() {
@@ -4246,7 +4247,7 @@ mod tests {
             ..hw_settings()
         };
         let clean = EncoderQuality {
-            last: Some(s.video_crf as u32),
+            last: Some(s.video_paintover_crf as u32),
             ..HOLDS
         };
         let mut st = StripeState::default();
