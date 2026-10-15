@@ -1345,6 +1345,10 @@ pub struct X11Pipeline {
     hw_state: StripeState,
     /// The content hashes of a full-frame session, one per band of `DAMAGE_BAND_ROWS` rows.
     bands: Vec<StripeState>,
+    /// The bands of the Turbo frames hashed on the CPU before their encode where the session
+    /// hashes its frames on the device (`FrameEncoder::hash_next_upload`): kept apart from
+    /// `bands`, which holds the device's hashes, a different function of the same picture.
+    checked: Vec<StripeState>,
     /// The bands the content hash found changed in the frame before this one, which a Turbo
     /// frame reads (`process`); empty until the first hash.
     turbo_dirty: Vec<bool>,
@@ -1380,6 +1384,7 @@ impl X11Pipeline {
             hw,
             hw_state: StripeState::default(),
             bands: Vec::new(),
+            checked: Vec::new(),
             turbo_dirty: Vec::new(),
             frame_counter: 0,
             pending_force_idr: false,
@@ -1668,13 +1673,25 @@ impl X11Pipeline {
             #[cfg(test)]
             let decided = (d.cleanup_quality(normal), d.force_idr);
             let mut hashed = None;
+            let on_device = turbo
+                && self.settings.use_paint_over_quality
+                && d.send
+                && self
+                    .hw
+                    .as_mut()
+                    .unwrap()
+                    .hash_next_upload(DAMAGE_BAND_ROWS as u32);
             if turbo
                 && self.settings.use_paint_over_quality
                 && d.send
                 && (d.cleanup_quality(normal).is_some() || d.cap.is_some() && d.hold_band.is_none())
             {
                 let dirty = hash_bands(
-                    &mut self.bands,
+                    if on_device {
+                        &mut self.checked
+                    } else {
+                        &mut self.bands
+                    },
                     argb,
                     stride,
                     height as usize,
@@ -1702,7 +1719,6 @@ impl X11Pipeline {
                 // device where NVENC uploads the frame, beside its encode, else on a thread
                 // beside it (`hash_beside`).
                 let beside = hashed.is_none() && turbo && self.settings.use_paint_over_quality;
-                let on_device = beside && d.send && enc.hash_next_upload(DAMAGE_BAND_ROWS as u32);
                 let mut encode = || {
                     if d.send {
                         enc.encode_host(argb, stride, false, fc, d.target_qp, force_idr)
@@ -1710,14 +1726,14 @@ impl X11Pipeline {
                         enc.push_held(fc)
                     }
                 };
-                let res = if let Some(dirty) = hashed {
-                    self.turbo_dirty = dirty;
-                    encode()
-                } else if on_device {
+                let res = if on_device {
                     let res = encode();
-                    self.turbo_dirty = match enc.take_upload_hashes() {
-                        Some(hashes) => hashed_bands(&mut self.bands, &hashes, threshold, duration),
-                        None => hash_bands(
+                    self.turbo_dirty = match (enc.take_upload_hashes(), hashed) {
+                        (Some(hashes), _) => {
+                            hashed_bands(&mut self.bands, &hashes, threshold, duration)
+                        }
+                        (None, Some(dirty)) => dirty,
+                        (None, None) => hash_bands(
                             &mut self.bands,
                             argb,
                             stride,
@@ -1727,6 +1743,9 @@ impl X11Pipeline {
                         ),
                     };
                     res
+                } else if let Some(dirty) = hashed {
+                    self.turbo_dirty = dirty;
+                    encode()
                 } else if beside {
                     let (res, dirty) = hash_beside(
                         &mut self.bands,
@@ -4072,6 +4091,47 @@ mod tests {
         assert!(info.encoder_reason.is_empty());
         assert_eq!(info.encode_node, 0);
         assert!(!info.driver.is_empty());
+    }
+
+    /// On NVENC, which hashes a Turbo frame on the device: a still screen reads as still through
+    /// its cleanup, whose capped frames are hashed on the CPU before they are coded, and cleans
+    /// up. Mixed into the device's band state, the CPU hashes read every band as changed two
+    /// frames in three, and the cleanup never came due. Ignored by default.
+    #[test]
+    #[ignore]
+    fn gpu_a_turbo_still_screen_reads_still_through_its_cleanup() {
+        let (w, h) = (1280usize, 720usize);
+        let mut p = X11Pipeline::new(RustCaptureSettings {
+            width: w as i32,
+            height: h as i32,
+            codec: Codec::H264,
+            target_fps: 60.0,
+            video_cbr_mode: true,
+            video_bitrate_kbps: 500,
+            video_streaming_mode: true,
+            use_paint_over_quality: true,
+            ..crate::x11::gpu_test_support::settings(Codec::H264)
+        });
+        assert!(p.is_hardware(), "needs NVENC");
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let picture: Vec<u8> = (0..w * h * 4)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed as u8
+            })
+            .collect();
+        let (mut changed, mut held) = (0, 0);
+        for n in 0..360 {
+            let _ = p.process(&picture, w * 4);
+            if n >= 60 && band_damage(&p.turbo_dirty).is_dirty() {
+                changed += 1;
+            }
+            held += p.hw_state.h264_burst_frames_remaining.min(1);
+        }
+        assert_eq!(changed, 0, "a still picture read as changed");
+        assert!(held > 0, "no cleanup ran");
     }
 
     /// With no motion, no request, and paint-over off, nothing is emitted at any frame-counter
