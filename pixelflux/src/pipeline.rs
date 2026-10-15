@@ -800,6 +800,11 @@ pub fn decide_hw_fullframe(
         return d;
     }
     if cleanup != Cleanup::None || recovery_idr {
+        // A key frame asked for codes a clean region again at the stream's own quality: it is due
+        // its cleanup again, as after a loss, a trigger period on.
+        if recovery_idr && cleanup == Cleanup::None {
+            st.lost_frame();
+        }
         d.send = true;
         d.force_idr = recovery_idr || cleanup == Cleanup::Key;
         d.hold_qp = cleanup_qp;
@@ -4276,6 +4281,43 @@ mod tests {
         let d = decide_hw_fullframe(&mut st, &s, 6, Damage::None, false, false, HOLDS);
         assert!(d.send && !d.force_idr);
         assert_eq!(d.target_qp, 25);
+    }
+
+    /// A key frame asked for on a still screen already cleaned up codes it again at the rate
+    /// control's quality, so the screen is due its cleanup again a trigger period on, as after a
+    /// loss; otherwise it stays as the key frame left it (VP8 and SVT-AV1 at 0.5 Mbit/s: 23-33 dB
+    /// for good where the cleanup had reached 37-48).
+    #[test]
+    fn a_key_frame_asked_for_on_a_clean_screen_is_cleaned_up_again() {
+        let s = hw_settings();
+        let held = EncoderQuality {
+            last: Some(30),
+            ..HOLDS
+        };
+        let mut st = StripeState::default();
+        decide_hw_fullframe(&mut st, &s, 0, Damage::Area(1.0), false, false, held);
+        let cleaned = |st: &mut StripeState, from: u16| {
+            (from..from + 40)
+                .filter(|&i| {
+                    decide_hw_fullframe(st, &s, i, Damage::None, false, false, held)
+                        .hold_qp
+                        .is_some()
+                })
+                .count()
+        };
+        assert!(cleaned(&mut st, 1) > 0, "the still screen is cleaned up");
+        assert!(
+            (41..80).all(|i| {
+                !decide_hw_fullframe(&mut st, &s, i, Damage::None, false, false, held).send
+            }),
+            "and goes quiet"
+        );
+        let key = decide_hw_fullframe(&mut st, &s, 80, Damage::None, false, true, held);
+        assert!(
+            key.send && key.force_idr && key.hold_qp.is_none(),
+            "the key frame asked for at the rate control's quality"
+        );
+        assert!(cleaned(&mut st, 81) > 0, "then the cleanup again");
     }
 
     #[test]

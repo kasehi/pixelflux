@@ -1644,6 +1644,11 @@ pub fn encode_cpu(
         let mut send_this_stripe = is_dirty || cleanup != Cleanup::None || force_idr_all;
         let mut quality_or_crf = if !video { jpeg_q } else { video_crf };
         let mut force_idr = video && (force_idr_all || cleanup == Cleanup::Key);
+        // A key frame asked for codes a clean stripe again at its rate control's quality: it is due
+        // its cleanup again, as after a loss, a trigger period on.
+        if force_idr_all && video && cleanup == Cleanup::None {
+            stripe_state.lost_frame();
+        }
         let mut hold = None;
         let quality = crate::pipeline::EncoderQuality {
             last: coded_quality(stripe_state),
@@ -1680,12 +1685,21 @@ pub fn encode_cpu(
             } else {
                 0
             };
-            if crate::pipeline::convergence(
+            // A run of a trigger period: after a key frame coded coarser, x264 codes the frames that
+            // follow at a fine quantizer while skipping most of the picture, so one small one says
+            // nothing of the picture.
+            stripe_state.fine_frames = if crate::pipeline::convergence(
                 quality.last,
                 bytes,
                 settings.video_paintover_crf.max(0) as u32,
                 budget,
             ) == crate::pipeline::Convergence::Converged
+            {
+                stripe_state.fine_frames.saturating_add(1)
+            } else {
+                0
+            };
+            if stripe_state.fine_frames >= trigger_frames
                 || stripe_state.idle_frames as f64 >= crate::pipeline::EMPTY_S * target_fps
             {
                 stripe_state.h264_burst_frames_remaining = 0;
@@ -1700,6 +1714,7 @@ pub fn encode_cpu(
             stripe_state.h264_burst_frames_remaining = crate::pipeline::converge_frames(settings);
             stripe_state.burst_held = false;
             stripe_state.idle_frames = 0;
+            stripe_state.fine_frames = 0;
         } else if video && (force_idr || cleanup != Cleanup::None) && video_burst > 0 {
             stripe_state.h264_burst_frames_remaining = video_burst;
             stripe_state.burst_held =
