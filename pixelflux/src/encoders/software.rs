@@ -410,8 +410,10 @@ pub struct H264EncoderWrapper {
     frame_num: WideFrameNum,
     /// The quantizer the next frame is held at whatever the rate control (`hold_quantizer`).
     held_qp: Option<i32>,
-    /// The quantizer the rate control last coded a frame at, held frames aside.
+    /// The mean quantizer the rate control last coded a frame's rows at, held frames aside.
     last_qp: Option<u32>,
+    /// The live rate factor, which x264 reports a frame's mean quantizer against (`last_qp`).
+    rf_constant: f64,
 }
 
 #[cfg(feature = "gpl")]
@@ -679,6 +681,7 @@ impl H264EncoderWrapper {
             if encoder.is_null() {
                 None
             } else {
+                x264_sys::x264_encoder_parameters(encoder, &mut param);
                 Some(Self {
                     encoder,
                     width,
@@ -699,6 +702,7 @@ impl H264EncoderWrapper {
                     frame_num: WideFrameNum::default(),
                     held_qp: None,
                     last_qp: None,
+                    rf_constant: param.rc.f_rf_constant as f64,
                 })
             }
         }
@@ -723,6 +727,7 @@ impl H264EncoderWrapper {
             param.rc.f_rf_constant = new_crf as f32;
             if x264_sys::x264_encoder_reconfig(self.encoder, &mut param) == 0 {
                 self.current_crf = new_crf;
+                self.rf_constant = new_crf as f64;
             }
         }
     }
@@ -794,7 +799,7 @@ impl H264EncoderWrapper {
         self.last_reference
     }
 
-    /// The quantizer the rate control last coded a frame at, held frames aside.
+    /// The mean quantizer the rate control last coded a frame's rows at, held frames aside.
     pub fn last_qp(&self) -> Option<u32> {
         self.last_qp
     }
@@ -985,9 +990,17 @@ impl H264EncoderWrapper {
             );
 
             if frame_size > 0 {
+                // x264 says the quantizer it planned the frame at, while its row-level control
+                // codes the rows that would overrun the buffer coarser, up to 51: on a still screen
+                // the plan falls to the paint-over quantizer and below with the rows still coarse.
+                // `f_crf_avg` is the rate factor plus the rows' mean less the pre-VBV quantizer,
+                // which the plan stands in for (never under it, so the mean never reads finer).
                 if held.is_none() {
-                    self.last_qp = (pic_out.i_qpplus1 > 0)
-                        .then(|| (pic_out.i_qpplus1 - 1 - offset).max(0) as u32);
+                    self.last_qp = (pic_out.i_qpplus1 > 0).then(|| {
+                        let planned = (pic_out.i_qpplus1 - 1) as f64;
+                        let coded = planned + pic_out.prop.f_crf_avg - self.rf_constant;
+                        (coded.round() as i32 - offset).clamp(0, 51) as u32
+                    });
                 }
                 let frame_type = if pic_out.i_type == x264_sys::X264_TYPE_IDR as i32 {
                     FRAME_KEY
@@ -1712,7 +1725,9 @@ pub fn encode_cpu(
             && converges
             && (cleanup != Cleanup::None || (force_idr && video_burst > 0 && armed))
         {
-            stripe_state.h264_burst_frames_remaining = crate::pipeline::converge_frames(settings);
+            // x264 says its quantizer and has no refresh after its rate control: it refines for as
+            // long as it gains, at 0.5 Mbit/s at 8 fps 1.7 dB a second still at 10 s.
+            stripe_state.h264_burst_frames_remaining = crate::pipeline::refine_frames(settings);
             stripe_state.burst_held = false;
             stripe_state.idle_frames = 0;
             stripe_state.fine_frames = 0;
@@ -2107,11 +2122,14 @@ pub fn stripe_count(height: i32, codec: Codec, fullframe: bool) -> usize {
 }
 
 /// Frames of the target a constant-rate x264 stripe is given as its buffer while its cleanup
-/// runs through the rate control: in the session's buffer of a frame and a half x264's
-/// row-level control prices a still screen's whole residual against the buffer and coarsens
-/// the rows it names a fine quantizer for, so a screen of text at 2 Mbit/s at 1080p sat at
-/// 31 dB while the frame quantizer read 19; in four it reached 46 dB in five seconds with no
-/// frame over a budget and a half.
+/// runs through the rate control, or `CLEANUP_FRAME_S` of its rate where that is more: in the
+/// session's buffer of a frame and a half x264's row-level control prices a still screen's whole
+/// residual against the buffer and coarsens the rows it names a fine quantizer for, so a screen
+/// of text at 2 Mbit/s at 1080p sat at 31 dB while the quantizer x264 planned read 19; in four
+/// it reached 46 dB in five seconds with no frame over a budget and a half. A row finer than its
+/// reference is priced at its whole intra cost against a slice's share of the buffer: at 60 fps
+/// four frames held a 1080p page at 0.5 Mbit/s at quantizer 30 and 25-35 dB, or at 51 after a
+/// scroll, where 0.2 s reached 55.7 dB in 30 s.
 #[cfg(feature = "gpl")]
 const CLEANUP_VBV_FRAMES: f64 = 4.0;
 
@@ -2119,13 +2137,14 @@ const CLEANUP_VBV_FRAMES: f64 = 4.0;
 /// (`CLEANUP_VBV_FRAMES`).
 #[cfg(feature = "gpl")]
 fn cleanup_vbv_kbit(settings: &RustCaptureSettings, bitrate_kbps: i32) -> i32 {
-    (crate::encoders::vbv_bits(
+    let frames = crate::encoders::vbv_bits(
         (bitrate_kbps as u32).saturating_mul(1000),
         settings.target_fps,
         0.0,
         CLEANUP_VBV_FRAMES,
-    ) / 1000)
-        .max(1) as i32
+    ) / 1000;
+    let seconds = (bitrate_kbps.max(0) as f64 * crate::pipeline::CLEANUP_FRAME_S).round() as u32;
+    frames.max(seconds).max(1) as i32
 }
 
 /// Split the configured rate budget across the stripes carrying it, returning the
@@ -3488,6 +3507,142 @@ mod qp_bound_sweep {
             worst = worst.max(enc.last_qp().unwrap_or(0));
         }
         assert!(worst <= 51, "a starved capped CRF coded quantizer {worst}");
+    }
+
+    /// A constant-rate session on a still screen of text after a scroll says the quantizer its
+    /// rows were coded at: at 1 Mbit/s at 720p x264 plans its frames at 17 while its row-level
+    /// control holds every row at 51, coding nothing, so a frame said to be that fine holds a
+    /// picture that fine.
+    #[cfg(feature = "gpl")]
+    #[test]
+    fn x264_says_the_quantizer_a_still_screens_rows_were_coded_at() {
+        const KBPS: i32 = 1000;
+        const SCROLL: usize = 30;
+        const STILL: usize = 300;
+        const PAINT_QP: u32 = 18;
+        let mut enc = H264EncoderWrapper::new(
+            W as i32,
+            H as i32,
+            25,
+            false,
+            60.0,
+            4,
+            true,
+            KBPS,
+            KBPS * 4 / 60,
+            0,
+            0,
+        )
+        .expect("x264 init");
+        let (u, v) = (vec![128u8; W * H / 4], vec![128u8; W * H / 4]);
+        let still = text_luma(SCROLL);
+        let mut dec = Decoder::new().expect("decoder");
+        let mut picture = vec![0u8; W * H];
+        let mut misread = Vec::new();
+        for i in 0..SCROLL + STILL {
+            let y = if i < SCROLL {
+                text_luma(i)
+            } else {
+                still.clone()
+            };
+            let mut out = Vec::new();
+            enc.encode_with_headers(
+                &y,
+                &u,
+                &v,
+                W as i32,
+                (W / 2) as i32,
+                (W / 2) as i32,
+                i as u16,
+                0,
+                i == 0,
+                true,
+                &mut out,
+            );
+            if let Some(img) = dec.decode(&out).expect("decode") {
+                let stride = img.strides().0;
+                for r in 0..H {
+                    picture[r * W..r * W + W].copy_from_slice(&img.y()[r * stride..r * stride + W]);
+                }
+            }
+            let psnr = mean_psnr(std::slice::from_ref(&picture), std::slice::from_ref(&still));
+            if i >= SCROLL && enc.last_qp().is_some_and(|q| q <= PAINT_QP) && psnr < 40.0 {
+                misread.push((i, enc.last_qp(), out.len(), psnr as i32));
+            }
+        }
+        assert!(
+            misread.is_empty(),
+            "frames said to be at the paint-over quantizer: {:?}",
+            &misread[..misread.len().min(8)]
+        );
+    }
+
+    /// A constant-rate session refines a still screen of text after a scroll in a cleanup's
+    /// buffer at 60 fps: in four frames x264's row-level control prices every row at its whole
+    /// intra cost against a slice's share and codes none, leaving 720p at 1 Mbit/s at 12 dB,
+    /// where in 0.2 s it reaches 39 dB in ten seconds.
+    #[cfg(feature = "gpl")]
+    #[test]
+    fn x264_refines_a_still_screen_after_a_scroll_in_a_cleanups_buffer() {
+        const KBPS: i32 = 1000;
+        const SCROLL: usize = 30;
+        const STILL: usize = 600;
+        let settings = RustCaptureSettings {
+            target_fps: 60.0,
+            ..Default::default()
+        };
+        let session_vbv =
+            (crate::encoders::vbv_bits(KBPS as u32 * 1000, 60.0, 0.0, 0.0) / 1000) as i32;
+        let mut enc = H264EncoderWrapper::new(
+            W as i32,
+            H as i32,
+            25,
+            false,
+            60.0,
+            4,
+            true,
+            KBPS,
+            session_vbv,
+            0,
+            0,
+        )
+        .expect("x264 init");
+        let (u, v) = (vec![128u8; W * H / 4], vec![128u8; W * H / 4]);
+        let still = text_luma(SCROLL);
+        let mut dec = Decoder::new().expect("decoder");
+        let mut picture = vec![0u8; W * H];
+        for i in 0..SCROLL + STILL {
+            if i == SCROLL {
+                enc.reconfigure_rate(KBPS, super::cleanup_vbv_kbit(&settings, KBPS), 60.0);
+            }
+            let y = if i < SCROLL {
+                text_luma(i)
+            } else {
+                still.clone()
+            };
+            let mut out = Vec::new();
+            enc.encode_with_headers(
+                &y,
+                &u,
+                &v,
+                W as i32,
+                (W / 2) as i32,
+                (W / 2) as i32,
+                i as u16,
+                0,
+                i == 0,
+                true,
+                &mut out,
+            );
+            if let Some(img) = dec.decode(&out).expect("decode") {
+                let stride = img.strides().0;
+                for r in 0..H {
+                    picture[r * W..r * W + W].copy_from_slice(&img.y()[r * stride..r * stride + W]);
+                }
+            }
+        }
+        let psnr = mean_psnr(std::slice::from_ref(&picture), std::slice::from_ref(&still));
+        assert!(psnr > 35.0, "a still screen refined to {psnr:.1} dB");
     }
 
     /// A CRF session capped or uncapped live codes its next key frame by the new setting.

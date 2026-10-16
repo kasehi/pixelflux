@@ -428,7 +428,7 @@ const PLATEAU_CHECKS: u32 = 2;
 
 /// Seconds of a link at the cleanup's rate a cleanup's frame may take to cross it (`cleanup_cap`):
 /// the session's buffer at 8 fps, under the backpressure gate's allowance.
-const CLEANUP_FRAME_S: f64 = 0.2;
+pub(crate) const CLEANUP_FRAME_S: f64 = 0.2;
 
 /// The most a cleanup runs at, in multiples of the session's rate (`cleanup_rate`): a sweep at
 /// 8 fps and 500 kbps over a fast path codes bands of two to six budgets.
@@ -507,12 +507,18 @@ pub fn converge_frames(settings: &RustCaptureSettings) -> i32 {
     (CONVERGE_S * settings.target_fps.max(1.0)).round() as i32
 }
 
+/// Frames a constant-rate cleanup through a rate control that says its quantizer flows at most,
+/// with no refresh to fall back to (`REFINE_S`).
+pub fn refine_frames(settings: &RustCaptureSettings) -> i32 {
+    (REFINE_S * settings.target_fps.max(1.0)).round() as i32
+}
+
 /// `converge_frames` for the session `encoder` describes (`REFINE_S`).
 fn cleanup_frames(settings: &RustCaptureSettings, encoder: EncoderQuality) -> i32 {
     if encoder.holds || (encoder.last.is_none() && !encoder.measures) {
         converge_frames(settings)
     } else {
-        (REFINE_S * settings.target_fps.max(1.0)).round() as i32
+        refine_frames(settings)
     }
 }
 
