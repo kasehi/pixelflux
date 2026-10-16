@@ -774,9 +774,16 @@ pub fn decide_hw_fullframe(
         damage,
     );
     let refresh_qp = held_refresh_quality(settings, encoder);
-    // The bands of the sweep a cleanup through the rate control falls back to, each sized to a
-    // frame's budget, are coded at the paint-over quantizer (`held_refresh_quality`).
-    let band_qp = if converges { paint_qp } else { refresh_qp };
+    // The bands of a sweep, each sized to a frame's budget, are coded at the paint-over quantizer:
+    // the fallback of a cleanup through the rate control, and a held refresh swept outside Turbo
+    // (libvpx's VP8 at 8 fps 0.5 Mbit/s 37.6 -> 42.8 dB). Under Turbo, whose frames between the
+    // bands flow at the rate control's quality, VP8's bands pinned that fine had those frames come
+    // out at up to 242 kB, so a held refresh's sweep there keeps the refresh's quantizer.
+    let band_qp = if converges || !settings.video_streaming_mode {
+        paint_qp
+    } else {
+        refresh_qp
+    };
     let cleanup_qp = match cleanup {
         Cleanup::Refresh if holds => Some(refresh_qp),
         Cleanup::Key => Some(paint_qp),
@@ -3114,6 +3121,35 @@ mod tests {
     /// (libvpx's VP8), sweeps that refresh a band a frame from the top, each a budget, until it
     /// covers the picture, with no whole held frame; a caret blinking meanwhile leaves the sweep
     /// to finish.
+    /// Under Turbo a held refresh's sweep keeps the refresh's quantizer: the rate control's frames
+    /// flow between its bands, and VP8's came out at up to 242 kB beside bands pinned at the
+    /// paint-over quantizer.
+    #[test]
+    fn a_held_refresh_swept_under_turbo_keeps_the_refresh_quantizer() {
+        let s = RustCaptureSettings {
+            video_streaming_mode: true,
+            ..hw_settings()
+        };
+        let vp8 = EncoderQuality {
+            last: Some(38),
+            bytes: None,
+            holds: true,
+            reopens: false,
+            keys: false,
+            band: Some(0),
+            measures: false,
+            psnr: None,
+            refit: None,
+        };
+        let mut st = StripeState::default();
+        decide_hw_fullframe(&mut st, &s, 0, Damage::Area(1.0), false, false, vp8);
+        let band = (1..=200u16)
+            .map(|i| decide_hw_fullframe(&mut st, &s, i, Damage::None, false, false, vp8))
+            .find(|d| d.hold_band.is_some())
+            .expect("a sweep");
+        assert_eq!(band.hold_qp, Some(held_refresh_quality(&s, vp8)));
+    }
+
     #[test]
     fn a_held_refresh_that_holds_a_band_sweeps_the_picture() {
         let s = hw_settings();
@@ -3150,7 +3186,7 @@ mod tests {
             assert!(!d.force_idr, "no key frame");
             match d.hold_band {
                 Some(band) => {
-                    assert!(d.send && d.hold_qp == Some(held_refresh_quality(&s, vp8(0))));
+                    assert!(d.send && d.hold_qp == Some(s.video_paintover_crf as u32));
                     bands.push(band);
                 }
                 None => assert!(d.hold_qp.is_none(), "no whole held frame, frame {i}"),

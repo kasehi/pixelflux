@@ -533,6 +533,12 @@ impl VpxEncoder {
         }
         let capped = force_idr && self.rate.cbr;
         let cap = (self.rate.bps() as f64 / 8.0 * super::HELD_KEY_BUDGET_S) as usize;
+        // A key frame skips nothing, so a band is held on a predicted one alone, and a key frame
+        // asked for where a band was due goes at the rate control's quality rather than whole at
+        // the band's quantizer.
+        if force_idr && self.held_band.is_some() {
+            self.held = None;
+        }
         let held = self.held.take().map(|crf| {
             if capped {
                 super::held_key_start(crf, self.held_key, cap)
@@ -543,7 +549,6 @@ impl VpxEncoder {
         if let Some(crf) = held {
             self.pin_quantizer(crf)?;
         }
-        // A key frame skips nothing, so a band is held on a predicted one alone.
         let band = self
             .held_band
             .take()
