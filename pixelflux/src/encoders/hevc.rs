@@ -52,6 +52,9 @@ struct Coded {
     bytes: Vec<u8>,
     pts: u64,
     qp: u32,
+    /// The bytes the rate control spent on the frame, the filler it pads a constant rate with
+    /// included, which `bytes` leaves out.
+    spent: usize,
 }
 
 impl HevcEncoder {
@@ -137,7 +140,8 @@ impl HevcEncoder {
         self.last_quality
     }
 
-    /// The bytes of the last frame the rate control coded, held frames aside.
+    /// The bytes the rate control spent on its last frame, held frames aside: its filler counted,
+    /// as the rate control counts it, though the frame goes without it (`Coded::spent`).
     pub fn last_size(&self) -> Option<usize> {
         self.last_bytes
     }
@@ -228,7 +232,7 @@ impl HevcEncoder {
         };
         if held.is_none() {
             self.last_quality = Some(coded.qp);
-            self.last_bytes = Some(coded.bytes.len());
+            self.last_bytes = Some(coded.spent);
         }
         let id = self.pending.take(coded.pts).unwrap_or(frame_number as u16);
         let mut output = Vec::with_capacity(VIDEO_HEADER_LEN + coded.bytes.len());
@@ -272,6 +276,9 @@ mod x265 {
     use codec_sys::x265::*;
 
     use super::*;
+
+    /// HEVC's filler data NAL unit type (FD_NUT).
+    const FILLER_NAL: u32 = 38;
 
     pub struct Backend {
         api: *const x265_api,
@@ -491,16 +498,24 @@ mod x265 {
             if count == 0 {
                 return Ok(None);
             }
+            // A constant rate pads every frame short of its budget with filler data (`strict-cbr`),
+            // which tells a decoder nothing: 44% of a still screen's stream at 60 fps and 54% at
+            // 8 fps at 0.5 Mbit/s at 1080p. It stays off the wire.
             let mut bytes = Vec::new();
+            let mut spent = 0;
             for nal in unsafe { std::slice::from_raw_parts(nals, count as usize) } {
-                bytes.extend_from_slice(unsafe {
-                    std::slice::from_raw_parts(nal.payload, nal.sizeBytes as usize)
-                });
+                spent += nal.sizeBytes as usize;
+                if nal.type_ != FILLER_NAL {
+                    bytes.extend_from_slice(unsafe {
+                        std::slice::from_raw_parts(nal.payload, nal.sizeBytes as usize)
+                    });
+                }
             }
             Ok(Some(Coded {
                 bytes,
                 pts: out[0].pts.max(0) as u64,
                 qp: out[0].frameData.qp.round().clamp(0.0, 51.0) as u32,
+                spent,
             }))
         }
     }
@@ -714,6 +729,7 @@ mod kvazaar {
                     unsafe { (*recon).pts.max(0) as u64 }
                 };
                 coded = Some(Coded {
+                    spent: bytes.len(),
                     bytes,
                     pts: out_pts,
                     qp: info.qp.clamp(0, 51) as u32,
@@ -769,6 +785,41 @@ mod tests {
             ]
         );
         assert!(!enc.invalidate_reference(1));
+    }
+
+    /// A constant rate's still frames go without the filler x265 pads them to their budget with,
+    /// which the cleanup still reads as spent: the frames on the wire come to a fraction of it.
+    #[cfg(feature = "gpl")]
+    #[test]
+    fn a_constant_rates_filler_stays_off_the_wire() {
+        let settings = RustCaptureSettings {
+            width: 320,
+            height: 240,
+            target_fps: 30.0,
+            codec: Codec::H265,
+            video_cbr_mode: true,
+            video_bitrate_kbps: 1000,
+            ..Default::default()
+        };
+        let mut enc = HevcEncoder::new(&settings, false).expect("session");
+        let bgra: Vec<u8> = (0..320 * 240 * 4).map(|i| ((i * 7) % 251) as u8).collect();
+        let (mut sent, mut spent) = (0, 0);
+        for t in 0..60u64 {
+            let out = enc
+                .encode_host(&bgra, 320 * 4, false, t, 25, false)
+                .expect("encode");
+            if t >= 30 && !out.is_empty() {
+                let payload = &out[VIDEO_HEADER_LEN..];
+                let mut at = 0;
+                while let Some(i) = payload[at..].windows(3).position(|w| w == [0, 0, 1]) {
+                    at += i + 3;
+                    assert_ne!((payload[at] >> 1) & 0x3f, 38, "frame {t} carries filler");
+                }
+                sent += payload.len();
+                spent += enc.last_size().unwrap_or(0);
+            }
+        }
+        assert!(spent > 2 * sent, "{sent} bytes sent of {spent} spent");
     }
 
     /// The library is configured at the capture's rate as the fraction it names.
