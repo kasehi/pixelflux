@@ -1296,8 +1296,8 @@ const CARRY_FALL: f32 = 0.05;
 
 /// Whether the striped software path holds a stripe's cleanup at the quantizer asked for:
 /// libx264 does under either rate control, and OpenH264 moves its quantizer only at a constant
-/// quality (`Openh264Encoder::update_qp`), so a stripe that holds none is cleaned up by a refresh
-/// and burst at its rate control's own quality, never a key frame, which that would starve.
+/// quality (`Openh264Encoder::update_qp`), so a stripe that holds none is cleaned up through its
+/// rate control (`encode_cpu`), never by a key frame, which that would starve.
 pub fn stripes_hold_quantizer(settings: &RustCaptureSettings) -> bool {
     cfg!(feature = "gpl") || !settings.video_cbr_mode
 }
@@ -1458,7 +1458,10 @@ pub fn encode_cpu(
         }
     };
     let holds = stripes_hold_quantizer(settings);
-    let converges = codec.is_video() && settings.video_cbr_mode && cfg!(feature = "gpl");
+    // A constant-rate stripe is cleaned up through its rate control: x264 refines a still screen
+    // within its buffer, and OpenH264, which moves its quantizer only by a rebuild, past its frame
+    // skip, a skipped frame telling nothing of the picture (`rc_bytes` 0).
+    let converges = codec.is_video() && settings.video_cbr_mode;
     let keys = codec.is_video() && holds && !converges;
     let paint_over_armed = |st: &StripeState| {
         if !codec.is_video() {
@@ -1725,8 +1728,9 @@ pub fn encode_cpu(
             && converges
             && (cleanup != Cleanup::None || (force_idr && video_burst > 0 && armed))
         {
-            // x264 says its quantizer and has no refresh after its rate control: it refines for as
-            // long as it gains, at 0.5 Mbit/s at 8 fps 1.7 dB a second still at 10 s.
+            // Neither encoder has a refresh after its rate control: it refines for as long as it
+            // gains, x264 at 0.5 Mbit/s at 8 fps 1.7 dB a second still at 10 s, and OpenH264 at
+            // 1080p first waits out seconds of frame skip after the frame that changed the page.
             stripe_state.h264_burst_frames_remaining = crate::pipeline::refine_frames(settings);
             stripe_state.burst_held = false;
             stripe_state.idle_frames = 0;
@@ -1997,15 +2001,17 @@ pub fn encode_cpu(
                     enc.reconfigure_rate(video_bitrate, target_fps);
                 }
 
-                let enc = stripe_state.h264_encoder.as_mut()?;
-                match enc.encode_stripe_argb(
+                let coded = stripe_state.h264_encoder.as_mut()?.encode_stripe_argb(
                     stripe_bytes,
                     width_usize * 4,
                     frame_counter as u64,
                     y_start as u16,
                     force_idr,
                     use_gpu,
-                ) {
+                );
+                stripe_state.rc_bytes = coded.as_ref().map_or(0, Vec::len);
+                let enc = stripe_state.h264_encoder.as_mut()?;
+                match coded {
                     Ok(data) if !data.is_empty() => Some(EncodedStripe {
                         data: Arc::new(data),
                         codec: Codec::H264,
@@ -2391,6 +2397,106 @@ mod tests {
         );
     }
     use super::{Codec, StripeState, compute_stripe_geometries};
+
+    /// Without `gpl` a constant-rate stripe is cleaned up through OpenH264's rate control past the
+    /// frames it skips: a page coded far over the target is followed by seconds of skipped frames,
+    /// which say nothing of the picture, and the cleanup refines once they end, where a burst of
+    /// a few frames ran out inside them and left the picture as the page's own frame had it.
+    #[cfg(not(feature = "gpl"))]
+    #[test]
+    fn openh264_cleans_up_past_the_frames_it_skips() {
+        use crate::RustCaptureSettings;
+        use openh264::decoder::Decoder;
+        use openh264::formats::YUVSource;
+        let (w, h) = (640, 352);
+        let settings = RustCaptureSettings {
+            width: w,
+            height: h,
+            codec: Codec::H264,
+            target_fps: 30.0,
+            video_cbr_mode: true,
+            video_bitrate_kbps: 150,
+            video_fullframe: true,
+            video_streaming_mode: false,
+            omit_stripe_headers: true,
+            ..Default::default()
+        };
+        let flat = vec![128u8; (w * h * 4) as usize];
+        let page: Vec<u8> = (0..(w * h) as usize)
+            .flat_map(|i| {
+                let v = if ((i * 2654435761usize) >> 7).is_multiple_of(3) {
+                    230
+                } else {
+                    20
+                };
+                [v, v, v, 255]
+            })
+            .collect();
+        let (mut stripes, mut carrying) = (Vec::new(), 1.0f32);
+        let mut dec = Decoder::new().expect("decoder");
+        let (mut sent, mut skipped_before_last, mut last) = (0usize, false, None);
+        for i in 0..900u16 {
+            let px = if i < 10 { &flat } else { &page };
+            let out = super::encode_cpu(
+                &mut stripes,
+                &mut carrying,
+                px,
+                w,
+                h,
+                &[],
+                &settings,
+                i,
+                false,
+                true,
+                i == 0,
+            );
+            for stripe in &out {
+                if i >= 10 {
+                    sent += 1;
+                }
+                if let Ok(Some(img)) = dec.decode(&stripe.data) {
+                    let stride = img.strides().0;
+                    last = Some(
+                        (0..h as usize)
+                            .flat_map(|r| img.y()[r * stride..r * stride + w as usize].to_vec())
+                            .collect::<Vec<u8>>(),
+                    );
+                }
+            }
+            if i > 10
+                && out.is_empty()
+                && stripes
+                    .first()
+                    .is_some_and(|st| st.h264_burst_frames_remaining > 0)
+            {
+                skipped_before_last = true;
+            }
+        }
+        let luma: Vec<u8> = page.chunks(4).map(|p| p[0]).collect();
+        let picture = last.expect("a picture");
+        let mse = picture
+            .iter()
+            .zip(&luma)
+            .map(|(&a, &b)| {
+                let d = (a as f64 - 16.0) * 255.0 / 219.0 - b as f64;
+                d * d
+            })
+            .sum::<f64>()
+            / luma.len() as f64;
+        let psnr = 10.0 * (255.0f64 * 255.0 / mse.max(1e-9)).log10();
+        println!(
+            "frames sent after the page: {sent}, skipped inside the cleanup: {skipped_before_last}, {psnr:.1} dB"
+        );
+        assert!(
+            skipped_before_last,
+            "the rate control skipped frames inside the cleanup"
+        );
+        assert!(
+            sent > 20,
+            "the cleanup refined past the skipped frames: {sent} frames"
+        );
+        assert!(psnr > 30.0, "{psnr:.1} dB");
+    }
 
     /// Without `gpl` the striped H.264 path runs one OpenH264 instance per stripe and speaks
     /// the x264 stripes' protocol: the first frame emits every stripe as an IDR whose wire header
