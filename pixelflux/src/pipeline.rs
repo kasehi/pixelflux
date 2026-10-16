@@ -115,6 +115,10 @@ const LEVEL_S: f64 = 4.0;
 /// paint-over quantizer is 86 budgets of text at 2 Mbit/s at 1080p and queues for 240 ms on a
 /// 12 Mbit/s link.
 const FIRST_BAND: f64 = 1.0 / 64.0;
+
+/// The share of a sweep's frames left that the rest of the picture may take at a quantizer step
+/// finer before the sweep steps finer: room for the bands' cost to vary down the picture.
+const SWEEP_FINER_SHARE: f64 = 0.8;
 const BAND_BUDGETS: f64 = 1.0;
 
 impl Damage {
@@ -863,6 +867,16 @@ pub fn decide_hw_fullframe(
         let budget = frame_budget(cleanup_rate(settings), settings.target_fps);
         let held = std::mem::take(&mut st.sweep_held).then(|| encoder.band.unwrap_or(0));
         st.sweep_debt = (st.sweep_debt + held.unwrap_or(0) as f64 - budget).max(0.0);
+        // What the whole picture comes to at the refresh's quantizer by the bands so far, each at
+        // what it came out, six steps coarser a halving.
+        if let Some(bytes) = held.filter(|&b| b > 0 && size > 0.0) {
+            let cost = bytes as f64 / size * 2f64.powf(st.sweep_coarser as f64 / 6.0);
+            st.sweep_cost = if st.sweep_cost > 0.0 {
+                (st.sweep_cost + cost) / 2.0
+            } else {
+                cost
+            };
+        }
         if st.sweep_debt >= budget {
             st.sweep = Some((from, size));
             st.sweep_frames = st.sweep_frames.saturating_add(1);
@@ -876,8 +890,22 @@ pub fn decide_hw_fullframe(
         let paced = encoder
             .band
             .is_some_and(|b| b as f64 <= 2.0 * BAND_BUDGETS * budget);
-        if paced && (1.0 - to) / size > left.max(1.0) {
-            st.sweep_coarser += 1;
+        // The rest of the picture at that cost against the frames left: a step coarser where it
+        // would run past them, a step finer where a step finer still ends well within them. At
+        // 0.2 Mbit/s at 1080p a first band far past its budget had the bands after it, sized down
+        // a halving a frame, read as more than the window holds frame after frame, which stepped
+        // them to quantizer 43 and ended the sweep at 32.5 dB in 9 s of a 30 s window.
+        if paced && st.sweep_cost > 0.0 {
+            let frames = |coarser: u32| {
+                (1.0 - to) * st.sweep_cost * 0.5f64.powf(coarser as f64 / 6.0) / budget
+            };
+            if frames(st.sweep_coarser) > left.max(1.0) {
+                st.sweep_coarser += 1;
+            } else if st.sweep_coarser > 0
+                && frames(st.sweep_coarser - 1) < SWEEP_FINER_SHARE * left
+            {
+                st.sweep_coarser -= 1;
+            }
         }
         let q = band_qp + st.sweep_coarser;
         if encoder.last.is_some_and(|last| q >= last) {
@@ -1019,6 +1047,7 @@ fn start_sweep(st: &mut StripeState, d: &mut HwFrameDecision, qp: u32) {
     st.sweep_frames = 0;
     st.sweep_coarser = 0;
     st.sweep_debt = 0.0;
+    st.sweep_cost = 0.0;
     st.sweep_held = true;
 }
 
@@ -3137,8 +3166,8 @@ mod tests {
     }
 
     /// A sweep whose bands, each a budget, would take longer than `REFINE_S` to cover the picture
-    /// is coded a step coarser a band until its pace fits: here a picture of four times as many
-    /// budgets at the refresh's quantizer, half that six steps coarser.
+    /// is coded a step coarser a band until its pace fits, and holds that pace: here a picture of
+    /// four times as many budgets at the refresh's quantizer, half that six steps coarser.
     #[test]
     fn a_sweep_that_would_run_past_refine_s_is_coded_coarser() {
         let s = hw_settings();
@@ -3169,20 +3198,24 @@ mod tests {
                 bands.push((a, b, q));
             }
         }
-        let coarser = bands.last().unwrap().2 - refresh;
         assert_eq!(bands.last().unwrap().1, 1.0, "the sweep covers the picture");
         assert!(
             bands.len() <= window + window / 10,
             "within REFINE_S: {} bands",
             bands.len()
         );
+        let mut counts = std::collections::BTreeMap::new();
+        for b in &bands {
+            *counts.entry(b.2).or_insert(0usize) += 1;
+        }
+        let (&pace, &held) = counts.iter().max_by_key(|(_, n)| **n).unwrap();
         assert!(
-            bands.windows(2).all(|w| w[0].2 <= w[1].2),
-            "never finer again"
+            (12..=15).contains(&(pace - refresh)) && held > bands.len() * 3 / 4,
+            "most bands about the 12 steps that quarter the picture's cost: {counts:?}"
         );
         assert!(
-            (12..=15).contains(&coarser),
-            "about the 12 steps that quarter the picture's cost: {coarser}"
+            bands.iter().all(|b| b.2 <= pace + 1),
+            "none past the pace: {counts:?}"
         );
     }
 
