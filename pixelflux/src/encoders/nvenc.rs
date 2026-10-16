@@ -26,7 +26,7 @@
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::os::unix::io::AsRawFd;
 use std::ptr;
@@ -876,10 +876,37 @@ fn set_cbr_rate(rc: &mut NV_ENC_RC_PARAMS, bps: u32, vbv: u32) {
 /// bytes a block of it came to (`NvencEncoder::cap`): the next rows of a page can be denser.
 const REFIT_SHARE: f64 = 0.8;
 
+/// Recent frames whose held bands the session keeps (`forget_bands`): past how far back an
+/// invalidation of its own before an anchor reaches (`reference::HOLD_MAX`, 384).
+const BAND_LOG_FRAMES: usize = 512;
+
 /// Fill `map`, the QP delta map of a `width` x `height` picture of `codec` (one entry a 16x16
 /// macroblock for H.264, a 32x32 coding tree block for HEVC, a 64x64 superblock for AV1, in
 /// raster order), with `delta` over the blocks the share of the picture `from..to` covers,
 /// rounded outward, and 0 elsewhere.
+/// The band a frame codes once the frames from timestamp `pts` on are left out of every
+/// prediction, their bands taken out of `log`: the one it holds (`held`) reaching back over theirs;
+/// and whether theirs are lost, a frame that holds no quantizer (`holds`) taking none of them back.
+/// A frame held whole codes them anyway.
+fn reach_back(
+    log: &mut VecDeque<(u64, f64, f64)>,
+    pts: u64,
+    held: Option<(f64, f64)>,
+    holds: bool,
+) -> (Option<(f64, f64)>, bool) {
+    let from = log
+        .iter()
+        .filter(|b| b.0 >= pts)
+        .map(|b| b.1)
+        .reduce(f64::min);
+    log.retain(|b| b.0 < pts);
+    match (from, held) {
+        (Some(from), Some((a, b))) => (Some((a.min(from), b)), false),
+        (Some(_), None) => (None, !holds),
+        (None, held) => (held, false),
+    }
+}
+
 fn fill_band_map(
     map: &mut Vec<i8>,
     codec: Codec,
@@ -1649,6 +1676,11 @@ pub struct NvencEncoder {
     held_qp: Option<u32>,
     held_band: Option<(f64, f64)>,
     hold_refused: bool,
+    /// The bands held in recent frames, by the timestamp the device knows each frame by, and
+    /// whether a frame that held none left some of them out of every prediction since the
+    /// cleanup last asked (`take_lost_cleanup`).
+    band_log: VecDeque<(u64, f64, f64)>,
+    lost_cleanup: bool,
     /// The bytes the next frame may come to (`cap`), and where the last was taken back for coming
     /// out past them and coded again, how far its held band then reached, or 0 (`refit`).
     cap: Option<usize>,
@@ -2694,6 +2726,8 @@ impl NvencEncoder {
                 cap: None,
                 refit: None,
                 hold_refused: false,
+                band_log: VecDeque::new(),
+                lost_cleanup: false,
                 held_bytes: 0,
                 qp_map: Vec::new(),
                 last_quality: None,
@@ -2978,7 +3012,11 @@ impl NvencEncoder {
     /// frame is coded instead.
     pub fn take_report(&mut self, report: ReferenceReport) -> bool {
         match report {
-            ReferenceReport::Lost(frame_id) => self.invalidate_reference(frame_id),
+            ReferenceReport::Lost(frame_id) => {
+                // The cleanup starts again for a loss (`StripeState::lost_frame`).
+                self.band_log.clear();
+                self.invalidate_reference(frame_id)
+            }
             ReferenceReport::Held(frame_id) => {
                 self.acknowledge_reference(frame_id, true);
                 true
@@ -3482,6 +3520,41 @@ impl NvencEncoder {
         self.refit
     }
 
+    /// Whether a frame left a held band out of every prediction since this was last asked (an
+    /// anchor predicting from the newest frame every client was sent, past a band coded since),
+    /// where the frame held none to take it back into: the cleanup has to run again.
+    pub fn take_lost_cleanup(&mut self) -> bool {
+        std::mem::take(&mut self.lost_cleanup)
+    }
+
+    /// The frames from timestamp `pts` on have just been left out of every prediction: a band one
+    /// of them held is coded again in the band this frame holds, which then reaches back to it,
+    /// and is lost to a frame that holds none (`take_lost_cleanup`).
+    fn forget_bands(&mut self, pts: u64) {
+        let (band, lost) = reach_back(
+            &mut self.band_log,
+            pts,
+            self.held_band,
+            self.held_qp.is_some(),
+        );
+        self.held_band = band;
+        self.lost_cleanup |= lost;
+    }
+
+    /// Whether the session's H.264 deblocking filter runs, which it does but on a frame holding a
+    /// band: at the edges a band shares with blocks held at the coarsest quantizer it filters at
+    /// their mean quantizer and softens the rows a band before refined (at 60 fps 0.5 Mbit/s a
+    /// 1080p row from 44.5 dB to 33.9). The slice header carries it; NVENC's HEVC puts it in a
+    /// picture parameter set it does not send again, and AV1 has no switch.
+    fn set_deblocking(&mut self, on: bool) {
+        if self.codec == Codec::H264 {
+            self.encode_config
+                .encodeCodecConfig
+                .h264Config
+                .disableDeblockingFilterIDC = u32::from(!on);
+        }
+    }
+
     /// The bytes of the last held frame (0 before one), where the session holds a band: H.264,
     /// HEVC and AV1, whose QP delta map is one entry a macroblock, a 32x32 coding tree block, or a
     /// 64x64 superblock.
@@ -3503,6 +3576,7 @@ impl NvencEncoder {
         if constant && !mapped && saved.constQP.qpIntra == q && saved.constQP.qpInterP == q {
             return None;
         }
+        self.set_deblocking(!mapped);
         let rc = &mut self.encode_config.rcParams;
         if mapped {
             rc.qpMapMode = NV_ENC_QP_MAP_MODE::NV_ENC_QP_MAP_DELTA;
@@ -3514,6 +3588,7 @@ impl NvencEncoder {
         let status = self.reconfigure(false, false);
         if status != NVENCSTATUS::NV_ENC_SUCCESS {
             self.encode_config.rcParams = saved;
+            self.set_deblocking(true);
             if !std::mem::replace(&mut self.hold_refused, true) {
                 eprintln!(
                     "[NVENC] Holding a frame at quantizer {q} refused ({status:?}): {}",
@@ -3647,8 +3722,10 @@ impl NvencEncoder {
         let output_bitstream = self.bitstream_buffers[self.current_buffer_idx];
         self.current_buffer_idx = (self.current_buffer_idx + 1) % self.bitstream_buffers.len();
 
+        let asked_idr = force_idr;
         let mut force_idr =
             force_idr || self.references.as_ref().is_some_and(|r| !r.has_reference());
+        let mut forgot = None;
         if !force_idr
             && let Some(references) = &mut self.references
             && references.plan_anchor(false).is_some()
@@ -3659,6 +3736,7 @@ impl NvencEncoder {
                         self.encoder_session,
                         pts,
                     ) != NVENCSTATUS::NV_ENC_SUCCESS;
+                    forgot = Some(pts);
                 }
                 Some(Invalidation::KeyFrame) => force_idr = true,
                 _ => {}
@@ -3671,10 +3749,24 @@ impl NvencEncoder {
                         self.encoder_session,
                         pts,
                     ) != NVENCSTATUS::NV_ENC_SUCCESS;
+                    forgot = Some(forgot.map_or(pts, |f: u64| f.min(pts)));
                 }
                 Some(Invalidation::KeyFrame) => force_idr = true,
                 _ => {}
             }
+        }
+        if force_idr {
+            // A key frame of the device's own codes the picture at the stream's quality, or with
+            // a band at the coarsest outside it: the bands before are gone.
+            if !asked_idr
+                && !self.band_log.is_empty()
+                && (self.held_band.is_some() || self.held_qp.is_none())
+            {
+                self.lost_cleanup = true;
+            }
+            self.band_log.clear();
+        } else if let Some(pts) = forgot {
+            self.forget_bands(pts);
         }
         let anchor = self
             .references
@@ -3841,8 +3933,17 @@ impl NvencEncoder {
                 self.refit = Some(end);
             }
         }
+        if let (Some(_), Some((from, to)), Ok(_)) = (held, band, &result) {
+            let to = self.refit.unwrap_or(to);
+            self.band_log
+                .push_back((pic_params.inputTimeStamp, from, to));
+            if self.band_log.len() > BAND_LOG_FRAMES {
+                self.band_log.pop_front();
+            }
+        }
         if let Some(rc) = held {
             self.encode_config.rcParams = rc;
+            self.set_deblocking(true);
             let status = self.reconfigure(false, false);
             if status != NVENCSTATUS::NV_ENC_SUCCESS {
                 eprintln!(
@@ -4897,6 +4998,35 @@ mod tests {
             assert_eq!(av1.ltrNumFrames, anchors as u32);
             assert_eq!(av1.maxNumRefFramesInDPB, AV1_REFERENCES);
         }
+    }
+
+    /// Frames an anchor's settling leaves out of every prediction take the bands they held with
+    /// them: the band the anchor holds reaches back over theirs, and an anchor that holds none
+    /// loses them to the cleanup; bands before them stay as they are.
+    #[test]
+    fn bands_left_out_of_the_predictions_are_coded_again() {
+        let sweep = || VecDeque::from([(10, 0.0, 0.1), (11, 0.1, 0.2), (12, 0.2, 0.3)]);
+        let mut log = sweep();
+        assert_eq!(
+            reach_back(&mut log, 11, Some((0.3, 0.4)), true),
+            (Some((0.1, 0.4)), false)
+        );
+        assert_eq!(log, VecDeque::from([(10, 0.0, 0.1)]));
+        assert_eq!(
+            reach_back(&mut sweep(), 11, None, false),
+            (None, true),
+            "a frame holding nothing loses them"
+        );
+        assert_eq!(
+            reach_back(&mut sweep(), 11, None, true),
+            (None, false),
+            "a frame held whole codes them"
+        );
+        assert_eq!(
+            reach_back(&mut sweep(), 13, Some((0.3, 0.4)), true),
+            (Some((0.3, 0.4)), false),
+            "no band among the frames left out"
+        );
     }
 
     /// A band's share of the picture lands on the blocks it covers, rounded outward, so the bands

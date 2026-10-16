@@ -1283,6 +1283,16 @@ impl FrameEncoder {
         }
     }
 
+    /// Whether a frame left a held band out of every prediction with no band of its own to take
+    /// it back into since this was last asked: NVENC, whose anchors predict from the newest frame
+    /// every client was sent (`NvencEncoder::take_lost_cleanup`).
+    pub fn take_lost_cleanup(&mut self) -> bool {
+        match self {
+            FrameEncoder::Nvenc(enc) => enc.take_lost_cleanup(),
+            _ => false,
+        }
+    }
+
     /// The bytes of the last frame held at a quantizer (0 before one), where the session holds a
     /// band of a frame at it (`hold_quantizer`): NVENC's H.264, HEVC and AV1 sessions, through a
     /// QP delta map, and libvpx's VP8, through a region-of-interest map.

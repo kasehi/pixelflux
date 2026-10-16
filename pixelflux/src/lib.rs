@@ -1581,6 +1581,9 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<FrameE
 
         let mut out: Vec<EncodedStripe> = Vec::new();
         if let Some(ref mut encoder) = video_encoder {
+            if encoder.take_lost_cleanup() {
+                hw_state.lost_frame();
+            }
             let decision = crate::pipeline::decide_hw_fullframe(
                 &mut hw_state,
                 &settings,

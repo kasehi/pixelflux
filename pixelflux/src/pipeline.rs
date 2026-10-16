@@ -1679,6 +1679,13 @@ impl X11Pipeline {
                     duration,
                 )
             };
+            if self
+                .hw
+                .as_mut()
+                .is_some_and(FrameEncoder::take_lost_cleanup)
+            {
+                self.hw_state.lost_frame();
+            }
             let quality = EncoderQuality::of(self.hw.as_ref().unwrap());
             let mut d = decide_hw_fullframe(
                 &mut self.hw_state,
