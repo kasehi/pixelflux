@@ -3544,8 +3544,8 @@ impl NvencEncoder {
     /// Whether the session's H.264 deblocking filter runs, which it does but on a frame holding a
     /// band: at the edges a band shares with blocks held at the coarsest quantizer it filters at
     /// their mean quantizer and softens the rows a band before refined (at 60 fps 0.5 Mbit/s a
-    /// 1080p row from 44.5 dB to 33.9). The slice header carries it; NVENC's HEVC puts it in a
-    /// picture parameter set it does not send again, and AV1 has no switch.
+    /// 1080p row from 44.5 dB to 33.9). The slice header carries it; NVENC's HEVC codes the same
+    /// bytes whatever the switch says on a reconfigure, and AV1 has none.
     fn set_deblocking(&mut self, on: bool) {
         if self.codec == Codec::H264 {
             self.encode_config
