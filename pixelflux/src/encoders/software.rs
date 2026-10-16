@@ -1070,7 +1070,8 @@ impl H264EncoderWrapper {
 ///   and `motion` (the share of recent frames in motion) are what `pipeline::cleanup_due` weighs
 ///   to pick the cleanup's moment and kind; `clean_quality` keeps a constant-quality session at
 ///   the paint-over quality from a cleanup until the region changes again; `rc_bytes` (the bytes of
-///   the stripe's last frame under its rate control), `idle_frames` (a constant-rate cleanup's run
+///   the stripe's last frame under its rate control), `rc_debt` (the bytes a cleanup's rate control
+///   has spent past its target and not yet repaid), `idle_frames` (a constant-rate cleanup's run
 ///   of small frames short of the paint-over quality, of empty ones for x264), `same_frames` (of
 ///   frames the size of the one before), `finest` and `finest_frames` (the finest quality index
 ///   its rate control has coded at and the frames since), and `over_frames` (its run of frames over
@@ -1107,6 +1108,7 @@ pub struct StripeState {
     pub burst_held: bool,
     pub clean_quality: bool,
     pub rc_bytes: usize,
+    pub rc_debt: f64,
     pub idle_frames: u32,
     pub over_frames: u32,
     pub same_frames: u32,

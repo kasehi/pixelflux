@@ -830,6 +830,10 @@ pub fn decide_hw_fullframe(
                 st.over_frames = 0;
                 st.same_frames = 0;
                 st.rc_bytes = 0;
+                // The frame that made the region due its cleanup may be the overshoot repaid in it.
+                st.rc_debt = (encoder.bytes.unwrap_or(0) as f64
+                    - frame_budget(settings.video_bitrate_kbps, settings.target_fps))
+                .max(0.0);
                 st.finest = None;
                 st.finest_frames = 0;
                 st.fine_frames = 0;
@@ -911,6 +915,14 @@ pub fn decide_hw_fullframe(
         st.h264_burst_frames_remaining = 0;
         st.settled = !encoder.holds;
     }
+    // A rate control repays a frame it coded far over the target with ones under it at its
+    // coarsest, which say nothing of where it stops refining: kvazaar's at 60 fps 0.5 Mbit/s
+    // spends 59 budgets on the frame after a scroll and then holds quantizer 51 for a second. One
+    // whose coarsest stays over the target is not repaying.
+    if converges && st.h264_burst_frames_remaining > 0 {
+        st.rc_debt = (st.rc_debt + encoder.bytes.unwrap_or(0) as f64 - budget).max(0.0);
+    }
+    let repaying = st.rc_debt > budget && encoder.bytes.is_some_and(|b| (b as f64) < budget);
     if converges && st.h264_burst_frames_remaining > 0 {
         match convergence(encoder.last, encoder.bytes, paint_qp, budget) {
             Convergence::Converged if !encoder.measures => {
@@ -918,6 +930,7 @@ pub fn decide_hw_fullframe(
                 st.change_mass = 0.0;
                 st.settled = !encoder.holds;
             }
+            Convergence::Idle if repaying => {}
             Convergence::Converged | Convergence::Idle => {
                 st.idle_frames = st.idle_frames.saturating_add(1)
             }
@@ -956,7 +969,8 @@ pub fn decide_hw_fullframe(
                 0
             };
             st.rc_bytes = bytes;
-            let same = st.same_frames as f64 >= EMPTY_S * settings.target_fps
+            let same = !repaying
+                && st.same_frames as f64 >= EMPTY_S * settings.target_fps
                 && encoder.last.is_some_and(|q| q >= SAME_FRAME_QUALITY);
             let level = st.finest_frames as f64 >= LEVEL_S * settings.target_fps;
             if ((stalled || same || level) && !encoder.measures)
@@ -2761,6 +2775,48 @@ mod tests {
         assert!(
             held <= 300 / (trigger as usize * LOW_MOTION_TRIGGERS as usize),
             "{held} held refreshes"
+        );
+    }
+
+    /// A rate control that coded the frame before a still screen far over its target repays it
+    /// with frames under the target at its coarsest, which is no stall: the cleanup runs past the
+    /// stall's run until it is repaid, as kvazaar's at 60 fps 0.5 Mbit/s holds quantizer 51 for a
+    /// second after 59 budgets, and still ends.
+    #[test]
+    fn a_rate_control_repaying_an_overshoot_is_not_stalled() {
+        let s = hw_settings();
+        let budget = frame_budget(s.video_bitrate_kbps, s.target_fps);
+        let quality = |bytes: f64, q: u32| EncoderQuality {
+            last: Some(q),
+            bytes: Some(bytes as usize),
+            holds: false,
+            reopens: false,
+            keys: true,
+            band: None,
+            measures: false,
+            psnr: None,
+            refit: None,
+        };
+        let mut st = StripeState::default();
+        let mut last = quality(budget * 60.0, 35);
+        decide_hw_fullframe(&mut st, &s, 0, Damage::Area(1.0), false, false, last);
+        let sent = (1..=400u16)
+            .filter(|&i| {
+                let d = decide_hw_fullframe(&mut st, &s, i, Damage::None, false, false, last);
+                if d.send {
+                    last = quality(budget / 10.0, 51);
+                }
+                d.send
+            })
+            .count();
+        let stall = (STALL_TRIGGERS * s.paint_over_trigger_frames) as usize;
+        assert!(
+            sent > 50 + stall,
+            "{sent} frames: the cleanup ran past the repayment"
+        );
+        assert!(
+            sent < (REFINE_S * s.target_fps) as usize,
+            "{sent} frames: it still ends"
         );
     }
 
