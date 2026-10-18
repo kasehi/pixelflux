@@ -41,6 +41,15 @@ pub struct HevcEncoder {
 
 unsafe impl Send for HevcEncoder {}
 
+/// `HevcEncoder::reach_finer`: the predicted frames of either library at a quantizer leave the
+/// motion's coarse blocks as they are. x265's (4.2) cleanup of 1080p text ended at 45.0-46.3 dB
+/// at the paint-over quantizer and at 49.7-52.4 six steps finer at 1 and 2 Mbit/s, where its key
+/// frame at the paint-over quantizer decodes at 50.0, on a fifth to three fifths more bytes over
+/// a few seconds more (twelve came to 50.4-55.9 over up to 29 s); kvazaar's at 8 fps 0.5 and 1
+/// Mbit/s at 44.4-45.0 against 47.4-47.9, its rate control settling about the paint-over
+/// quantizer at 2 Mbit/s whatever the cleanup asks (44.8-46.8 dB either way).
+const HEVC_REACH_FINER: u32 = 6;
+
 /// Whether the build's software HEVC encoder codes 10 bits: x265 where it was built with its
 /// 10-bit encoder linked in.
 pub fn ten_bit() -> bool {
@@ -132,6 +141,12 @@ impl HevcEncoder {
     /// before it 53.9 dB), so a constant-rate session holds none.
     pub fn holds_quantizer(&self) -> bool {
         Backend::HOLDS_QUANTIZER && !self.rate.cbr
+    }
+
+    /// The quantizer steps finer than the paint-over one at which a constant rate's frames come
+    /// to the paint-over quality (`FrameEncoder::reach_finer`): `HEVC_REACH_FINER`.
+    pub fn reach_finer(&self) -> u32 {
+        if self.rate.cbr { HEVC_REACH_FINER } else { 0 }
     }
 
     /// The quality index (HEVC's quantizer) the rate control last coded a frame at, held frames
@@ -796,6 +811,34 @@ mod tests {
             ]
         );
         assert!(!enc.invalidate_reference(1));
+    }
+
+    /// A constant-rate session's frames come to the paint-over quality six quantizer steps finer
+    /// than the paint-over quantizer, a constant quality's at it.
+    #[test]
+    fn a_constant_rate_cleanup_reaches_six_steps_finer() {
+        let mut settings = RustCaptureSettings {
+            width: 64,
+            height: 48,
+            target_fps: 30.0,
+            codec: Codec::H265,
+            video_crf: 25,
+            ..Default::default()
+        };
+        assert_eq!(
+            HevcEncoder::new(&settings, false)
+                .expect("session")
+                .reach_finer(),
+            0
+        );
+        settings.video_cbr_mode = true;
+        settings.video_bitrate_kbps = 500;
+        assert_eq!(
+            HevcEncoder::new(&settings, false)
+                .expect("session")
+                .reach_finer(),
+            6
+        );
     }
 
     /// An x265 session codes with 8x8 coding units, finer than its preset's 16x16, at every size

@@ -1291,6 +1291,18 @@ impl FrameEncoder {
         }
     }
 
+    /// The quantizer steps finer than the paint-over one at which the rate control's frames come
+    /// to the paint-over quality, where a constant-rate cleanup runs through it: the software
+    /// HEVC encoders' predicted frames at a quantizer leave the motion's coarse blocks as they
+    /// are, and x265's cleanup ended at 45-46 dB at the paint-over quantizer where its key frame
+    /// there decodes at 50 (`HevcEncoder::reach_finer`). Elsewhere none.
+    pub fn reach_finer(&self) -> u32 {
+        match self {
+            FrameEncoder::Hevc(enc) => enc.reach_finer(),
+            _ => 0,
+        }
+    }
+
     /// Where the last frame was taken back and coded again (`cap`): how far its held band then
     /// reached, or 0 for a frame of the rate control's.
     pub fn refit(&self) -> Option<f64> {

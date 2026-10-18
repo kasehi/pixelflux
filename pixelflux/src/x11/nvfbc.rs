@@ -1158,6 +1158,7 @@ where
                 psnr: None,
                 refit: gpu.encoder.refit(),
                 follows_cap: false,
+                finer: 0,
             },
         );
         let normal = gpu.settings.video_crf as u32;

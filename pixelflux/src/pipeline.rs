@@ -365,6 +365,9 @@ pub struct EncoderQuality {
     /// Whether it codes a still screen's cleanup frame at the rate its cap runs at
     /// (`FrameEncoder::follows_cap`), so the frame is judged against the cleanup's budget.
     pub follows_cap: bool,
+    /// The quantizer steps finer than the paint-over one at which its rate control's frames
+    /// come to the paint-over quality (`FrameEncoder::reach_finer`).
+    pub finer: u32,
 }
 
 impl EncoderQuality {
@@ -381,6 +384,7 @@ impl EncoderQuality {
             psnr: encoder.last_psnr(),
             refit: encoder.refit(),
             follows_cap: encoder.follows_cap(),
+            finer: encoder.reach_finer(),
         }
     }
 
@@ -533,7 +537,8 @@ fn cleanup_frames(settings: &RustCaptureSettings, encoder: EncoderQuality) -> i3
 /// Whether a cleanup improves the picture at all: at a constant quality where the paint-over
 /// quality is finer than the session's (the cleanup then moves the session's quality, see
 /// `decide_constant_quality`); at a constant rate where it is finer than the quality index the
-/// rate control last coded at, or the encoder does not say. A rate control that has already
+/// rate control last coded at, less the steps its frames need to come to the paint-over quality
+/// (`EncoderQuality::finer`), or the encoder does not say. A rate control that has already
 /// refined a still screen past it (a constant rate refines every frame it sends) is left alone:
 /// holding the paint-over quantizer there would coarsen the picture. A constant-rate encoder
 /// that holds no quantizer is cleaned up by the rate control's own frames, a refresh and its
@@ -543,7 +548,7 @@ pub fn paint_over_improves(settings: &RustCaptureSettings, encoder: EncoderQuali
     let paint = settings.video_paintover_crf.max(0) as u32;
     settings.cleans_up()
         && if settings.video_cbr_mode {
-            encoder.last.is_none_or(|q| q > paint)
+            encoder.last.is_none_or(|q| q + encoder.finer > paint)
         } else {
             settings.video_paintover_crf < settings.video_crf
         }
@@ -696,8 +701,10 @@ fn refresh_quality(settings: &RustCaptureSettings, encoder: EncoderQuality, spen
 ///    VP9) has no refresh to fall back to, so its frames flow, each the rate control's, until the
 ///    picture is done: where the session measures its reconstruction against its source (VA-API,
 ///    `plateau`) until that stops improving, else after a trigger period of frames at the
-///    paint-over quantizer or once the finest quantizer it has coded at has stood for
-///    `LEVEL_S`; and in either case after `STALL_TRIGGERS` periods of small frames or
+///    paint-over quantizer, or as much finer as its frames need to come to the paint-over
+///    quality (`EncoderQuality::finer`: six steps for x265 and kvazaar), or once the finest
+///    quantizer it has coded at has stood for `LEVEL_S`; and in either case after
+///    `STALL_TRIGGERS` periods of small frames or
 ///    `REFINE_S`. A fixed burst left such a screen where the motion did (19 to 27 dB at
 ///    2 Mbit/s at 1080p on iHD, x265, and SVT-AV1, each frame within its budget), and a
 ///    reported quantizer alone ends it early or never: iHD's H.264 average reads 26 through
@@ -971,7 +978,9 @@ pub fn decide_hw_fullframe(
     }
     let repaying = st.rc_debt > budget && encoder.bytes.is_some_and(|b| (b as f64) < budget);
     if converges && st.h264_burst_frames_remaining > 0 {
-        match convergence(encoder.last, encoder.bytes, paint_qp, budget) {
+        // The quantizer the rate control's frames come to the paint-over quality at.
+        let reach_qp = paint_qp.saturating_sub(encoder.finer);
+        match convergence(encoder.last, encoder.bytes, reach_qp, budget) {
             Convergence::Converged if !encoder.measures => {
                 st.h264_burst_frames_remaining = 0;
                 st.change_mass = 0.0;
@@ -983,7 +992,7 @@ pub fn decide_hw_fullframe(
             }
             Convergence::Refining => st.idle_frames = 0,
         }
-        st.fine_frames = if encoder.last.is_some_and(|q| q <= paint_qp) {
+        st.fine_frames = if encoder.last.is_some_and(|q| q <= reach_qp) {
             st.fine_frames.saturating_add(1)
         } else {
             0
@@ -2021,6 +2030,7 @@ mod tests {
         psnr: None,
         refit: None,
         follows_cap: false,
+        finer: 0,
     };
 
     /// A settings block for the hardware full-frame policy: a constant rate, whose cleanup holds
@@ -2174,6 +2184,7 @@ mod tests {
             psnr: None,
             refit: None,
             follows_cap: false,
+            finer: 0,
         };
         let mut st = StripeState::default();
         for i in 0..3u16 {
@@ -2407,6 +2418,7 @@ mod tests {
             psnr: None,
             refit: None,
             follows_cap: false,
+            finer: 0,
         };
         let converged = EncoderQuality {
             last: Some(8),
@@ -2419,6 +2431,7 @@ mod tests {
             psnr: None,
             refit: None,
             follows_cap: false,
+            finer: 0,
         };
         let window = 1 + 6 * trigger;
         let mut st = StripeState::default();
@@ -2446,6 +2459,58 @@ mod tests {
         }));
     }
 
+    /// A rate control whose frames need a quantizer finer than the paint-over one to come to its
+    /// quality (`EncoderQuality::finer`, x265's and kvazaar's) is refined past it: a trigger
+    /// period of frames at the paint-over quantizer goes on, one at as much finer ends the
+    /// cleanup, and a still screen coded between the two still owes one.
+    #[test]
+    fn a_rate_control_that_needs_a_finer_quantizer_is_refined_past_the_paint_over_one() {
+        let s = hw_settings();
+        let budget = frame_budget(s.video_bitrate_kbps, s.target_fps) as usize;
+        let at = |last: u32| EncoderQuality {
+            last: Some(last),
+            bytes: Some(budget),
+            holds: false,
+            reopens: false,
+            keys: true,
+            band: None,
+            measures: false,
+            psnr: None,
+            refit: None,
+            follows_cap: false,
+            finer: 6,
+        };
+        let trigger = s.paint_over_trigger_frames as u16;
+        let paint = s.video_paintover_crf as u32;
+        let mut st = StripeState::default();
+        decide_hw_fullframe(&mut st, &s, 0, Damage::Area(1.0), false, false, at(30));
+        for i in 1..4 * trigger {
+            decide_hw_fullframe(&mut st, &s, i, Damage::None, false, false, at(30));
+        }
+        let start = 4 * trigger;
+        assert!(
+            (start..start + 4 * trigger).all(|i| {
+                decide_hw_fullframe(&mut st, &s, i, Damage::None, false, false, at(paint)).send
+            }),
+            "frames at the paint-over quantizer go on"
+        );
+        let finer = start + 4 * trigger;
+        assert!(
+            (finer..finer + trigger).all(|i| {
+                decide_hw_fullframe(&mut st, &s, i, Damage::None, false, false, at(paint - 6)).send
+            }),
+            "a trigger period of frames six steps finer"
+        );
+        assert!(
+            (finer + trigger..finer + 100).all(|i| {
+                !decide_hw_fullframe(&mut st, &s, i, Damage::None, false, false, at(paint - 6)).send
+            }),
+            "ends it"
+        );
+        assert!(paint_over_improves(&s, at(paint)));
+        assert!(!paint_over_improves(&s, at(paint - 6)));
+    }
+
     /// A session that holds no quantizer has no refresh to fall back to: its cleanup flows
     /// through the rate control past the periods of a level quantizer a holding one is given,
     /// and ends after a trigger period of frames coded at the paint-over quantizer, whatever
@@ -2465,6 +2530,7 @@ mod tests {
             psnr: None,
             refit: None,
             follows_cap: false,
+            finer: 0,
         };
         let trigger = s.paint_over_trigger_frames as u16;
         let past = 13 * trigger;
@@ -2550,6 +2616,7 @@ mod tests {
             psnr: None,
             refit: None,
             follows_cap: false,
+            finer: 0,
         };
         let trigger = s.paint_over_trigger_frames;
         let mut st = StripeState::default();
@@ -2590,6 +2657,7 @@ mod tests {
             psnr: None,
             refit: None,
             follows_cap: false,
+            finer: 0,
         };
         let mut st = StripeState::default();
         decide_hw_fullframe(&mut st, &s, 0, Damage::Area(1.0), false, false, crawling);
@@ -2639,6 +2707,7 @@ mod tests {
             psnr: None,
             refit: None,
             follows_cap: false,
+            finer: 0,
         };
         let mut st = StripeState::default();
         decide_hw_fullframe(&mut st, &s, 0, Damage::Area(1.0), false, false, pinned);
@@ -2688,6 +2757,7 @@ mod tests {
             psnr: None,
             refit: None,
             follows_cap: false,
+            finer: 0,
         };
         let mut st = StripeState::default();
         decide_hw_fullframe(&mut st, &s, 0, Damage::Area(1.0), false, false, pinned);
@@ -2748,6 +2818,7 @@ mod tests {
                 psnr: None,
                 refit: None,
                 follows_cap: false,
+                finer: 0,
             };
             let mut st = StripeState::default();
             decide_hw_fullframe(&mut st, &s, 0, Damage::Area(1.0), false, false, encoder);
@@ -2791,6 +2862,7 @@ mod tests {
                 psnr: None,
                 refit: None,
                 follows_cap,
+                finer: 0,
             };
             let mut st = StripeState::default();
             decide_hw_fullframe(&mut st, &s, 0, Damage::Area(1.0), false, false, encoder);
@@ -2834,6 +2906,7 @@ mod tests {
             psnr: None,
             refit,
             follows_cap: false,
+            finer: 0,
         };
         let mut st = StripeState {
             paint_over_sent: true,
@@ -2901,6 +2974,7 @@ mod tests {
             psnr: None,
             refit: None,
             follows_cap: false,
+            finer: 0,
         };
         let mut st = StripeState::default();
         decide_hw_fullframe(&mut st, &s, 0, Damage::Area(1.0), false, false, crawling);
@@ -2952,6 +3026,7 @@ mod tests {
             psnr: None,
             refit: None,
             follows_cap: false,
+            finer: 0,
         };
         let mut st = StripeState::default();
         let mut last = quality(budget * 60.0, 35);
@@ -2991,6 +3066,7 @@ mod tests {
             psnr: None,
             refit: None,
             follows_cap: false,
+            finer: 0,
         };
         let mut st = StripeState::default();
         decide_hw_fullframe(&mut st, &s, 0, Damage::Area(1.0), false, false, idle);
@@ -3032,6 +3108,7 @@ mod tests {
             psnr: None,
             refit: None,
             follows_cap: false,
+            finer: 0,
         };
         let mut st = StripeState::default();
         decide_hw_fullframe(&mut st, &s, 0, Damage::Area(1.0), false, false, idle(0));
@@ -3100,6 +3177,7 @@ mod tests {
             psnr: None,
             refit: None,
             follows_cap: false,
+            finer: 0,
         };
         let mut st = StripeState::default();
         decide_hw_fullframe(&mut st, &s, 0, Damage::Area(1.0), false, false, over(0));
@@ -3157,6 +3235,7 @@ mod tests {
             psnr: None,
             refit,
             follows_cap: false,
+            finer: 0,
         };
         let mut st = StripeState::default();
         let moving = decide_hw_fullframe(
@@ -3265,6 +3344,7 @@ mod tests {
             psnr: None,
             refit: None,
             follows_cap: false,
+            finer: 0,
         };
         let mut st = StripeState::default();
         decide_hw_fullframe(&mut st, &s, 0, Damage::Area(1.0), false, false, vp8);
@@ -3290,6 +3370,7 @@ mod tests {
             psnr: None,
             refit: None,
             follows_cap: false,
+            finer: 0,
         };
         let mut st = StripeState::default();
         decide_hw_fullframe(&mut st, &s, 0, Damage::Area(1.0), false, false, vp8(0));
@@ -3345,6 +3426,7 @@ mod tests {
             psnr: None,
             refit: None,
             follows_cap: false,
+            finer: 0,
         };
         let refresh = held_refresh_quality(&s, idle(0));
         let mut st = StripeState::default();
@@ -3402,6 +3484,7 @@ mod tests {
             psnr: None,
             refit: None,
             follows_cap: false,
+            finer: 0,
         };
         let mut st = StripeState::default();
         decide_hw_fullframe(&mut st, &s, 0, Damage::Area(1.0), false, false, level);
@@ -3433,6 +3516,7 @@ mod tests {
             psnr: None,
             refit: None,
             follows_cap: false,
+            finer: 0,
         };
         let mut st = StripeState::default();
         decide_hw_fullframe(&mut st, &s, 0, Damage::Area(1.0), false, false, idle);
@@ -3481,6 +3565,7 @@ mod tests {
             psnr: None,
             refit: None,
             follows_cap: false,
+            finer: 0,
         };
         let clean = EncoderQuality {
             last: Some(8),
@@ -3493,6 +3578,7 @@ mod tests {
             psnr: None,
             refit: None,
             follows_cap: false,
+            finer: 0,
         };
         let mut st = StripeState::default();
         assert!(
@@ -3540,6 +3626,7 @@ mod tests {
             psnr: None,
             refit: None,
             follows_cap: false,
+            finer: 0,
         };
         let coarse = EncoderQuality {
             last: Some(40),
@@ -3552,6 +3639,7 @@ mod tests {
             psnr: None,
             refit: None,
             follows_cap: false,
+            finer: 0,
         };
         let mut st = StripeState::default();
         let mut frame = 0u16;
@@ -3748,6 +3836,7 @@ mod tests {
             psnr: None,
             refit: None,
             follows_cap: false,
+            finer: 0,
         };
         let mut st = StripeState::default();
         decide_hw_fullframe(&mut st, &cbr, 1, Damage::Area(1.0), false, false, coarse);
@@ -3834,6 +3923,7 @@ mod tests {
                         psnr: None,
                         refit: None,
                         follows_cap: false,
+                        finer: 0,
                     },
                 );
                 if i > 0 && d.send {
@@ -3934,6 +4024,7 @@ mod tests {
             psnr: None,
             refit: None,
             follows_cap: false,
+            finer: 0,
         };
         let mut st = StripeState::default();
         for i in 0..3u16 {
@@ -4637,6 +4728,7 @@ mod tests {
                     psnr: None,
                     refit: None,
                     follows_cap: false,
+                    finer: 0,
                 },
             )
         };
