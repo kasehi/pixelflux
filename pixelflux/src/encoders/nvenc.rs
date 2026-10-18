@@ -880,10 +880,6 @@ const REFIT_SHARE: f64 = 0.8;
 /// invalidation of its own before an anchor reaches (`reference::HOLD_MAX`, 384).
 const BAND_LOG_FRAMES: usize = 512;
 
-/// Fill `map`, the QP delta map of a `width` x `height` picture of `codec` (one entry a 16x16
-/// macroblock for H.264, a 32x32 coding tree block for HEVC, a 64x64 superblock for AV1, in
-/// raster order), with `delta` over the blocks the share of the picture `from..to` covers,
-/// rounded outward, and 0 elsewhere.
 /// The band a frame codes once the frames from timestamp `pts` on are left out of every
 /// prediction, their bands taken out of `log`: the one it holds (`held`) reaching back over theirs;
 /// and whether theirs are lost, a frame that holds no quantizer (`holds`) taking none of them back.
@@ -907,6 +903,10 @@ fn reach_back(
     }
 }
 
+/// Fill `map`, the QP delta map of a `width` x `height` picture of `codec` (one entry a 16x16
+/// macroblock for H.264, a 32x32 coding tree block for HEVC, a 64x64 superblock for AV1, in
+/// raster order), with `delta` over the blocks the share of the picture `from..to` covers,
+/// rounded outward, and 0 elsewhere; returns the band's first block.
 fn fill_band_map(
     map: &mut Vec<i8>,
     codec: Codec,
@@ -914,7 +914,7 @@ fn fill_band_map(
     height: u32,
     (from, to): (f64, f64),
     delta: i32,
-) {
+) -> usize {
     let block = match codec {
         Codec::H264 => 16,
         Codec::H265 => 32,
@@ -926,6 +926,7 @@ fn fill_band_map(
     map.clear();
     map.resize(blocks, 0);
     map[first..last].fill(delta.clamp(-(codec.quantizer_max().min(128) as i32), 0) as i8);
+    first
 }
 
 /// The driver's message for the last failure on `session`, or a stand-in when it has none: NVENC
@@ -1139,12 +1140,20 @@ unsafe fn probe_session_codecs(
 /// divides evenly; the other modes count macroblocks, bytes, or rows and drift with geometry.
 const SLICE_MODE_COUNT: u32 = 3;
 
-/// Slices per H.264 and HEVC frame, the count the VA-API (`SLICES`; one for H.264 on AMD's VCE)
-/// and OpenH264 (`SM_FIXEDSLCNUM_SLICE`) sessions emit too: a client decoding in software threads
-/// a frame across its slices, and more than four upsets some Chromium decoders. What the slices cost at
-/// a fixed quantizer is measured by `gpu_bench_slices`. AV1 partitions by tiles instead, asked
-/// for as 1x1 in `configure_codec`.
+/// Slices per H.264 frame, the count the VA-API (`SLICES`; one for H.264 on AMD's VCE) and
+/// OpenH264 (`SM_FIXEDSLCNUM_SLICE`) sessions emit too: a client decoding in software threads a
+/// frame across its slices, and more than four upsets some Chromium decoders. What the slices cost
+/// at a fixed quantizer is measured by `gpu_bench_slices`. An HEVC frame is one slice, since no
+/// decoder a client has threads HEVC's plain slices (FFmpeg threads its wavefronts and tiles), and
+/// its band frames take theirs where a band starts (`set_band_layout`). AV1 partitions by tiles
+/// instead, asked for as 1x1 in `configure_codec`.
 const SLICES_PER_FRAME: u32 = 4;
+
+/// The most slices an HEVC band frame takes to start one at its band (`set_band_layout`). NVENC
+/// sizes a frame's slices evenly, so a band starting within the first eighth of the picture would
+/// take more, each a header a low rate's frame cannot spare: at 60 fps and 0.5 Mbit/s, 40 to 60 of
+/// them took most of a band frame's bytes and left its band coarse.
+const BAND_SLICES_MAX: usize = 8;
 
 /// The frames an AV1 session keeps, as many as a frame predicts from, LAST, LAST2, LAST3, and
 /// GOLDEN (`numFwdRefs` tops out at four). The device keeps eight as well, predicting past a loss
@@ -1185,9 +1194,10 @@ pub(crate) struct NvencTuning {
     /// same session at Main tier, the ceiling `gpu_hevc_high_tier_opens_above_the_main_tier_ceiling`
     /// measures.
     pub hevc_high_tier: bool,
-    /// Slices per H.264 and HEVC frame: `SLICES_PER_FRAME` in production, one to measure their
-    /// cost (`gpu_bench_slices`).
-    pub slices: u32,
+    /// Slices per H.264 and HEVC frame outside a band frame's: `None` in production, which is
+    /// `SLICES_PER_FRAME` for H.264 and one for HEVC; a count to measure what slices cost
+    /// (`gpu_bench_slices`).
+    pub slices: Option<u32>,
     /// Leave the chroma convert out, so the session encodes through NVENC's own conversion —
     /// the path a driver refusing the kernel takes, which
     /// `gpu_hardware_conversion_matches_the_declared_matrix` measures.
@@ -1210,7 +1220,7 @@ impl Default for NvencTuning {
             spatial_aq: false,
             temporal_aq: false,
             hevc_high_tier: true,
-            slices: SLICES_PER_FRAME,
+            slices: None,
             #[cfg(test)]
             hardware_csc: false,
             #[cfg(test)]
@@ -1675,6 +1685,9 @@ pub struct NvencEncoder {
     /// refused one, said once.
     held_qp: Option<u32>,
     held_band: Option<(f64, f64)>,
+    /// The `(sliceMode, sliceModeData)` of an HEVC session's frames outside a band frame's,
+    /// which `set_band_layout` puts back.
+    slice_layout: (u32, u32),
     hold_refused: bool,
     /// The bands held in recent frames, by the timestamp the device knows each frame by, and
     /// whether a frame that held none left some of them out of every prediction since the
@@ -2723,6 +2736,7 @@ impl NvencEncoder {
                 current_qp: codec.hardware_quantizer(Hardware::Nvenc, settings.video_crf),
                 held_qp: None,
                 held_band: None,
+                slice_layout: tuning.slices.map_or((0, 0), |n| (SLICE_MODE_COUNT, n)),
                 cap: None,
                 refit: None,
                 hold_refused: false,
@@ -2817,7 +2831,9 @@ impl NvencEncoder {
     /// sessions — follows the matrix declared here at the limited range it emits, which
     /// `gpu_hardware_conversion_matches_the_declared_matrix` holds it to. H.264 additionally
     /// restricts reordering in its VUI so no-reorder decoders don't buffer, and codes CABAC.
-    /// H.264 and HEVC frames carry `SLICES_PER_FRAME` slices; AV1 asks for one tile, since tiles
+    /// H.264 frames carry `SLICES_PER_FRAME` slices and HEVC frames one, an HEVC band frame its
+    /// own (`set_band_layout`), and an HEVC session filters across no slice boundary, which is
+    /// what keeps a band's slice from softening the rows refined before it; AV1 asks for one tile, since tiles
     /// cost bitrate and buy no quality, and tier 0, the only tier NVENC takes for it. The driver
     /// honors a 1x1 request below 1986 pixels of picture height; above that it forces a second
     /// tile row whatever is asked for, in the low-latency presets this one is among but not from
@@ -2872,8 +2888,9 @@ impl NvencEncoder {
                     } else {
                         0
                     };
-                    c.sliceMode = SLICE_MODE_COUNT;
-                    c.sliceModeData = tuning.slices;
+                    c.set_disableDeblockAcrossSliceBoundary(1);
+                    (c.sliceMode, c.sliceModeData) =
+                        tuning.slices.map_or((0, 0), |n| (SLICE_MODE_COUNT, n));
                     c.idrPeriod = 0xFFFFFFFF;
                     c.set_chromaFormatIDC(if fullcolor { 3 } else { 1 });
                     c.inputBitDepth = depth;
@@ -2915,7 +2932,7 @@ impl NvencEncoder {
                         c.ltrNumFrames = anchors as u32;
                     }
                     c.sliceMode = SLICE_MODE_COUNT;
-                    c.sliceModeData = tuning.slices;
+                    c.sliceModeData = tuning.slices.unwrap_or(SLICES_PER_FRAME);
                     c.idrPeriod = 0xFFFFFFFF;
                     c.chromaFormatIDC = if fullcolor { 3 } else { 1 };
                     c.set_repeatSPSPPS(1);
@@ -3541,17 +3558,34 @@ impl NvencEncoder {
         self.lost_cleanup |= lost;
     }
 
-    /// Whether the session's H.264 deblocking filter runs, which it does but on a frame holding a
-    /// band: at the edges a band shares with blocks held at the coarsest quantizer it filters at
-    /// their mean quantizer and softens the rows a band before refined (at 60 fps 0.5 Mbit/s a
-    /// 1080p row from 44.5 dB to 33.9). The slice header carries it; NVENC's HEVC codes the same
-    /// bytes whatever the switch says on a reconfigure, and AV1 has none.
-    fn set_deblocking(&mut self, on: bool) {
-        if self.codec == Codec::H264 {
-            self.encode_config
-                .encodeCodecConfig
-                .h264Config
-                .disableDeblockingFilterIDC = u32::from(!on);
+    /// Keep the deblocking filter off the rows the bands before refined, on a frame holding a band
+    /// whose first block is `band` (`None` on any other frame): at the edges a band shares with
+    /// blocks held at the coarsest quantizer, the filter works at their mean quantizer and softens
+    /// those rows (at 60 fps 0.5 Mbit/s a 1080p row from 44.5 dB to 33.9). H.264 turns the filter
+    /// off for the frame, which its slice header carries. NVENC's HEVC codes the same bytes
+    /// whatever its switch says on a reconfigure, so its band frame starts a slice at the band
+    /// instead, across whose boundary the session never filters (`configure_codec`), where that
+    /// takes at most `BAND_SLICES_MAX` even slices; a band starting before them keeps the frame's
+    /// own. AV1 has neither.
+    fn set_band_layout(&mut self, band: Option<usize>) {
+        match self.codec {
+            Codec::H264 => {
+                self.encode_config
+                    .encodeCodecConfig
+                    .h264Config
+                    .disableDeblockingFilterIDC = u32::from(band.is_some());
+            }
+            Codec::H265 => {
+                let blocks = (self.width.div_ceil(32) * self.height.div_ceil(32)) as usize;
+                let c = unsafe { &mut self.encode_config.encodeCodecConfig.hevcConfig };
+                (c.sliceMode, c.sliceModeData) = match band {
+                    Some(first) if first > 0 && blocks.div_ceil(first) <= BAND_SLICES_MAX => {
+                        (0, first as u32)
+                    }
+                    _ => self.slice_layout,
+                };
+            }
+            _ => {}
         }
     }
 
@@ -3562,21 +3596,23 @@ impl NvencEncoder {
         matches!(self.codec, Codec::H264 | Codec::H265 | Codec::Av1).then_some(self.held_bytes)
     }
 
-    /// Put the session on constant quantizer `q` for the picture about to be submitted, `mapped`
-    /// with the picture's QP delta map on top (`fill_band_map`), answering the rate control to
-    /// restore once it is encoded; `None` where the session is already there or the driver
-    /// refused, which leaves the picture to the rate control.
+    /// Put the session on constant quantizer `q` for the picture about to be submitted, with the
+    /// picture's QP delta map on top where it holds a band starting at block `band`
+    /// (`fill_band_map`), answering the rate control to restore once it is encoded; `None` where
+    /// the session is already there or the driver refused, which leaves the picture to the rate
+    /// control.
     ///
     /// The rate-control mode is one of the parameters `nvEncReconfigureEncoder` takes without a
     /// reset, so a constant-rate session keeps its HRD state across the held picture instead of
     /// starting over after it.
-    unsafe fn hold_rate(&mut self, q: u32, mapped: bool) -> Option<NV_ENC_RC_PARAMS> {
+    unsafe fn hold_rate(&mut self, q: u32, band: Option<usize>) -> Option<NV_ENC_RC_PARAMS> {
+        let mapped = band.is_some();
         let saved = self.encode_config.rcParams;
         let constant = saved.rateControlMode == NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CONSTQP;
         if constant && !mapped && saved.constQP.qpIntra == q && saved.constQP.qpInterP == q {
             return None;
         }
-        self.set_deblocking(!mapped);
+        self.set_band_layout(band);
         let rc = &mut self.encode_config.rcParams;
         if mapped {
             rc.qpMapMode = NV_ENC_QP_MAP_MODE::NV_ENC_QP_MAP_DELTA;
@@ -3588,7 +3624,7 @@ impl NvencEncoder {
         let status = self.reconfigure(false, false);
         if status != NVENCSTATUS::NV_ENC_SUCCESS {
             self.encode_config.rcParams = saved;
-            self.set_deblocking(true);
+            self.set_band_layout(None);
             if !std::mem::replace(&mut self.hold_refused, true) {
                 eprintln!(
                     "[NVENC] Holding a frame at quantizer {q} refused ({status:?}): {}",
@@ -3825,7 +3861,7 @@ impl NvencEncoder {
                 .min(q + i8::MIN.unsigned_abs() as u32);
             match band {
                 Some(share) if rest > q => {
-                    fill_band_map(
+                    let first = fill_band_map(
                         &mut self.qp_map,
                         self.codec,
                         self.width,
@@ -3833,14 +3869,14 @@ impl NvencEncoder {
                         share,
                         q as i32 - rest as i32,
                     );
-                    let held = self.hold_rate(rest, true);
+                    let held = self.hold_rate(rest, Some(first));
                     if held.is_some() {
                         pic_params.qpDeltaMap = self.qp_map.as_mut_ptr();
                         pic_params.qpDeltaMapSize = self.qp_map.len() as u32;
                     }
                     held
                 }
-                _ => self.hold_rate(q, false),
+                _ => self.hold_rate(q, None),
             }
         });
         let mut result = self.encode_picture(
@@ -3868,7 +3904,7 @@ impl NvencEncoder {
                 .hold_rate(
                     self.codec
                         .hardware_quantizer(Hardware::Nvenc, coarser as i32),
-                    false,
+                    None,
                 )
                 .is_some()
             && (force_idr || self.retract_last())
@@ -3911,7 +3947,7 @@ impl NvencEncoder {
                     Some(end)
                 }
                 (None, _, None) => {
-                    held = self.hold_rate(self.codec.quantizer_max(), false);
+                    held = self.hold_rate(self.codec.quantizer_max(), None);
                     held.map(|_| 0.0)
                 }
                 _ => None,
@@ -3943,7 +3979,7 @@ impl NvencEncoder {
         }
         if let Some(rc) = held {
             self.encode_config.rcParams = rc;
-            self.set_deblocking(true);
+            self.set_band_layout(None);
             let status = self.reconfigure(false, false);
             if status != NVENCSTATUS::NV_ENC_SUCCESS {
                 eprintln!(
@@ -7129,12 +7165,12 @@ mod gpu_tests {
     }
 
     /// The slice count and the HEVC tier are properties of the bitstream a client decodes, so
-    /// they are read back out of it on a real GPU: four VCL NAL units per H.264 and HEVC frame
-    /// at two geometries, and an HEVC SPS carrying the High tier flag beside the pinned level.
-    /// Ignored by default.
+    /// they are read back out of it on a real GPU: four VCL NAL units per H.264 frame and one
+    /// per HEVC frame at two geometries, and an HEVC SPS carrying the High tier flag beside the
+    /// pinned level. Ignored by default.
     #[test]
     #[ignore]
-    fn gpu_frames_carry_four_slices_and_hevc_declares_high_tier() {
+    fn gpu_frames_carry_their_slices_and_hevc_declares_high_tier() {
         use crate::encoders::codec::annexb_nals;
         for (w, h) in [(1280usize, 720usize), (640, 480)] {
             for codec in [Codec::H264, Codec::H265] {
@@ -7152,10 +7188,12 @@ mod gpu_tests {
                             _ => matches!(nal[0] & 0x1f, 1 | 5),
                         })
                         .count();
-                    assert_eq!(
-                        vcl, SLICES_PER_FRAME as usize,
-                        "{codec:?} {w}x{h} frame {i} slices"
-                    );
+                    let slices = if codec == Codec::H265 {
+                        1
+                    } else {
+                        SLICES_PER_FRAME as usize
+                    };
+                    assert_eq!(vcl, slices, "{codec:?} {w}x{h} frame {i} slices");
                     if codec == Codec::H264 && i == 0 {
                         // After the one-byte NAL header the SPS RBSP carries profile_idc, the
                         // constraint-flag byte, then level_idc, which must be the current
@@ -7193,6 +7231,126 @@ mod gpu_tests {
         }
     }
 
+    /// The first coding tree block of each slice of an HEVC access unit, read out of the slice
+    /// segment headers (the PPS has no dependent slice segments, which NVENC never enables), and
+    /// whether the access unit's PPS, where it carries one, filters across slice boundaries.
+    fn hevc_slice_starts(au: &[u8], ctbs: usize) -> (Vec<u32>, Option<bool>) {
+        use crate::encoders::codec::annexb_nals;
+        struct Bits<'a>(&'a [u8], usize);
+        impl Bits<'_> {
+            fn u(&mut self, n: u32) -> u32 {
+                (0..n).fold(0, |acc, _| {
+                    let bit = (self.0[self.1 / 8] >> (7 - self.1 % 8)) & 1;
+                    self.1 += 1;
+                    (acc << 1) | bit as u32
+                })
+            }
+            fn ue(&mut self) -> u32 {
+                let mut zeros = 0;
+                while self.u(1) == 0 {
+                    zeros += 1;
+                }
+                (1 << zeros) - 1 + self.u(zeros)
+            }
+        }
+        let address_bits = usize::BITS - (ctbs - 1).leading_zeros();
+        let (mut starts, mut across) = (Vec::new(), None);
+        for nal in annexb_nals(au) {
+            let kind = (nal[0] >> 1) & 0x3f;
+            let body = rbsp(nal);
+            let mut b = Bits(&body[2..], 0);
+            if kind == 34 {
+                b.ue();
+                b.ue();
+                b.u(7);
+                b.ue();
+                b.ue();
+                let _qp = b.ue();
+                b.u(2);
+                if b.u(1) == 1 {
+                    b.ue();
+                }
+                b.ue();
+                b.ue();
+                b.u(4);
+                let tiles = b.u(1) == 1;
+                b.u(1);
+                assert!(!tiles, "NVENC's HEVC codes no tiles");
+                across = Some(b.u(1) == 1);
+            } else if kind < 32 {
+                let first = b.u(1) == 1;
+                if (16..=23).contains(&kind) {
+                    b.u(1);
+                }
+                b.ue();
+                starts.push(if first { 0 } else { b.u(address_bits) });
+            }
+        }
+        (starts, across)
+    }
+
+    /// On a real GPU: an HEVC band frame starts a slice at its band's first coding tree block,
+    /// across which the session never filters, so the rows the bands before refined keep their
+    /// pixels; a band starting within the first `BAND_SLICES_MAX`th keeps the frame's one slice,
+    /// and the frame after it is one slice again. Every frame decodes. Ignored by default.
+    #[test]
+    #[ignore]
+    fn gpu_hevc_band_frames_start_a_slice_at_the_band() {
+        use crate::webcam::decode::{Decoder as _, VideoDecoder};
+        let (w, h) = (1920usize, 1080usize);
+        let ctbs = w.div_ceil(32) * h.div_ceil(32);
+        let mut s = settings(w as i32, h as i32, 60.0);
+        s.codec = Codec::H265;
+        s.omit_stripe_headers = true;
+        let mut enc = host_session(&s).expect("NVENC init");
+        let still = frame(w, h, 40);
+        let mut frames = Vec::new();
+        let mut encode = |enc: &mut NvencEncoder, i: u64| {
+            let pkt = enc
+                .encode_cpu_argb(&still, w * 4, i, 25, i == 0)
+                .expect("encode");
+            frames.push(pkt.clone());
+            hevc_slice_starts(&pkt, ctbs)
+        };
+        let (starts, across) = encode(&mut enc, 0);
+        assert_eq!(starts, [0], "a key frame is one slice");
+        assert_eq!(
+            across,
+            Some(false),
+            "the PPS filters across no slice boundary"
+        );
+        let mut i = 1u64;
+        for share in [0.5, 0.25, 0.75, 0.13, 0.05] {
+            assert_eq!(
+                encode(&mut enc, i).0,
+                [0],
+                "frame {i} before a band is one slice"
+            );
+            i += 1;
+            enc.hold_quantizer(10, Some((share, share + 0.02)));
+            let (starts, _) = encode(&mut enc, i);
+            i += 1;
+            let first = (share * ctbs as f64).floor() as usize;
+            if ctbs.div_ceil(first) <= BAND_SLICES_MAX {
+                assert!(
+                    starts.contains(&(first as u32)) && starts.len() <= BAND_SLICES_MAX,
+                    "a band from {first} starts a slice: {starts:?}"
+                );
+            } else {
+                assert_eq!(starts, [0], "a band from {first} keeps the frame's slice");
+            }
+        }
+        assert_eq!(
+            encode(&mut enc, i).0,
+            [0],
+            "the frame after a band is one slice"
+        );
+        let mut decoder = VideoDecoder::new(Codec::H265).unwrap();
+        for (k, f) in frames.iter().enumerate() {
+            assert!(decoder.decode(f).expect("decode"), "frame {k}");
+        }
+    }
+
     /// On a real GPU: what `SLICES_PER_FRAME` slices cost against one at a fixed quantizer,
     /// H.264 and HEVC at 1080p on the gradient frames the other benches use. Prints the rates and
     /// the difference; ignored by default.
@@ -7211,7 +7369,7 @@ mod gpu_tests {
             let mut sizes = Vec::new();
             for slices in [1u32, SLICES_PER_FRAME] {
                 let tuning = NvencTuning {
-                    slices,
+                    slices: Some(slices),
                     ..NvencTuning::default()
                 };
                 let mut enc = match NvencEncoder::new_tuned(&s, ptr::null(), tuning) {
@@ -7299,7 +7457,7 @@ mod gpu_tests {
                             s.video_bitrate_kbps = kbps as i32;
                             s.video_vbv_multiplier = vbv_frames;
                             let tuning = NvencTuning {
-                                slices,
+                                slices: Some(slices),
                                 ..NvencTuning::default()
                             };
                             let mut enc = match NvencEncoder::new_tuned(&s, ptr::null(), tuning) {
