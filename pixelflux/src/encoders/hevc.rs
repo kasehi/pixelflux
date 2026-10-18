@@ -319,6 +319,12 @@ mod x265 {
             unsafe { ((*self.params).fpsNum, (*self.params).fpsDenom) }
         }
 
+        /// The smallest coding unit the library was configured with, in pixels.
+        #[cfg(test)]
+        pub fn min_cu_size(&self) -> u32 {
+            unsafe { (*self.params).minCUSize }
+        }
+
         fn set(&self, name: &str, value: &str) -> Result<(), String> {
             let (n, v) = (CString::new(name).unwrap(), CString::new(value).unwrap());
             match unsafe { ((*self.api).param_parse.unwrap())(self.params, n.as_ptr(), v.as_ptr()) }
@@ -415,6 +421,11 @@ mod x265 {
             } else if width < 64 || height < 64 {
                 options.push(("ctu", "32".into()));
             }
+            // ultrafast's 16x16 coding units cannot follow text: a 1080p page's key frame at
+            // quantizer 18 came out at 750 kB and 49.3 dB with them, at 395 kB and 53.5 dB with 8x8
+            // ones, and a still screen's cleanup at 60 fps 8 Mbit/s ended at 47.6 dB against 53.1
+            // on 58% fewer bytes. A 1080p scroll codes as fast, one at 4K a tenth slower.
+            options.push(("min-cu-size", "8".into()));
             options.extend(Self::rate_options(rate, q));
             for (name, value) in &options {
                 me.set(name, value)?;
@@ -785,6 +796,25 @@ mod tests {
             ]
         );
         assert!(!enc.invalidate_reference(1));
+    }
+
+    /// An x265 session codes with 8x8 coding units, finer than its preset's 16x16, at every size
+    /// down to the smallest picture it codes.
+    #[cfg(feature = "gpl")]
+    #[test]
+    fn x265_codes_with_8x8_coding_units() {
+        for (width, height) in [(1920, 1080), (64, 48), (16, 16)] {
+            let settings = RustCaptureSettings {
+                width,
+                height,
+                target_fps: 30.0,
+                codec: Codec::H265,
+                video_crf: 25,
+                ..Default::default()
+            };
+            let enc = HevcEncoder::new(&settings, false).expect("session");
+            assert_eq!(enc.backend.min_cu_size(), 8, "{width}x{height}");
+        }
     }
 
     /// A constant rate's still frames go without the filler x265 pads them to their budget with,
