@@ -14,17 +14,21 @@
 //! which subscribes to the request object the portal will answer on before calling, as the
 //! handle-token convention requires; a consent dialog the backend shows blocks that call until
 //! the user answers. Input notifications are fire-and-forget method calls, so an event never
-//! waits on the bus round trip. A restore token the backend hands back is kept under the
+//! waits on the bus round trip. Each public call runs its async zbus calls to completion with
+//! [`zbus::block_on`] on the calling thread; between calls zbus drives the connection from a
+//! helper thread of its own, so a `Response` that lands meanwhile is queued for the stream that
+//! subscribed to it. A restore token the backend hands back is kept under the
 //! user's state directory, so a session reopened to change the cursor mode, and every later
 //! start on this machine, needs no second consent; a backend that hands out none (KDE) shows
 //! no dialog to an unsandboxed app in the first place.
 
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use zbus::blocking::{Connection, Proxy};
-use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
+use zbus::export::futures_core::Stream;
+use zbus::{Connection, OwnedObjectPath, OwnedVariant, Proxy, Variant};
 
 const DESKTOP: &str = "org.freedesktop.portal.Desktop";
 const DESKTOP_PATH: &str = "/org/freedesktop/portal/desktop";
@@ -41,7 +45,7 @@ pub const CURSOR_METADATA: u32 = 4;
 const SOURCE_MONITOR: u32 = 1;
 const PERSIST_UNTIL_REVOKED: u32 = 2;
 
-type Options<'a> = HashMap<&'a str, Value<'a>>;
+type Options<'a> = HashMap<&'a str, Variant<'a>>;
 
 /// One monitor stream the portal started: its PipeWire node and, where the backend says,
 /// its logical position and size in the compositor's coordinate space.
@@ -68,10 +72,13 @@ pub struct PortalSession {
     pub rd_version: u32,
     /// KDE's backend serves the session: it reads a smooth scroll's vertical axis negated.
     kde: bool,
+    /// Whether dropping the session closes it on the portal: not while `open` still runs it
+    /// inside its `zbus::block_on`, which a second one inside would panic on.
+    armed: bool,
 }
 
 fn opt_u32(o: &mut Options<'_>, key: &'static str, v: u32) {
-    o.insert(key, Value::U32(v));
+    o.insert(key, Variant::U32(v));
 }
 
 /// Where the portal's restore token lives between runs: `$XDG_STATE_HOME/pixelflux`, or
@@ -106,33 +113,33 @@ pub fn save_restore_token(token: &str) {
     }
 }
 
-fn value_i32(v: &Value<'_>) -> Option<i32> {
+fn value_i32(v: &Variant<'_>) -> Option<i32> {
     match v {
-        Value::I32(x) => Some(*x),
-        Value::U32(x) => Some(*x as i32),
-        Value::Value(inner) => value_i32(inner),
+        Variant::I32(x) => Some(*x),
+        Variant::U32(x) => Some(*x as i32),
+        Variant::Variant(inner) => value_i32(inner),
         _ => None,
     }
 }
 
-fn value_pair(v: &Value<'_>) -> Option<(i32, i32)> {
+fn value_pair(v: &Variant<'_>) -> Option<(i32, i32)> {
     match v {
-        Value::Structure(s) if s.fields().len() == 2 => {
+        Variant::Structure(s) if s.fields().len() == 2 => {
             Some((value_i32(&s.fields()[0])?, value_i32(&s.fields()[1])?))
         }
-        Value::Value(inner) => value_pair(inner),
+        Variant::Variant(inner) => value_pair(inner),
         _ => None,
     }
 }
 
 /// The `a(ua{sv})` stream list of a `Start` response.
-fn parse_streams(v: &Value<'_>) -> Vec<PortalStream> {
+fn parse_streams(v: &Variant<'_>) -> Vec<PortalStream> {
     let mut out = Vec::new();
-    let Value::Array(arr) = v else { return out };
+    let Variant::Array(arr) = v else { return out };
     for item in arr.iter() {
-        let Value::Structure(s) = item else { continue };
+        let Variant::Structure(s) = item else { continue };
         let fields = s.fields();
-        let Some(Value::U32(node_id)) = fields.first() else {
+        let Some(Variant::U32(node_id)) = fields.first() else {
             continue;
         };
         let mut stream = PortalStream {
@@ -140,9 +147,9 @@ fn parse_streams(v: &Value<'_>) -> Vec<PortalStream> {
             position: None,
             size: None,
         };
-        if let Some(Value::Dict(d)) = fields.get(1) {
+        if let Some(Variant::Dict(d)) = fields.get(1) {
             for (k, val) in d.iter() {
-                let Value::Str(k) = k else { continue };
+                let Variant::Str(k) = k else { continue };
                 match k.as_str() {
                     "position" => stream.position = value_pair(val),
                     "size" => stream.size = value_pair(val),
@@ -155,30 +162,64 @@ fn parse_streams(v: &Value<'_>) -> Vec<PortalStream> {
     out
 }
 
+/// The next message of `stream`, or `None` once it ends.
+async fn next_message<S: Stream + Unpin>(stream: &mut S) -> Option<S::Item> {
+    std::future::poll_fn(|cx| Pin::new(&mut *stream).poll_next(cx)).await
+}
+
+/// Whether KDE's portal backend owns its name on the bus `conn` is on.
+async fn kde_backend(conn: &Connection) -> bool {
+    let Ok(bus) = zbus::fdo::DBusProxy::new(conn).await else {
+        return false;
+    };
+    let Ok(name) = zbus::names::BusName::try_from("org.freedesktop.impl.portal.desktop.kde") else {
+        return false;
+    };
+    bus.name_has_owner(name).await.unwrap_or(false)
+}
+
 impl PortalSession {
     /// Open and start a session. `devices` (`DEVICE_*` bits) selects what input the session
     /// drives — zero opens a plain ScreenCast session; `capture` asks for every monitor as its
     /// own stream with `cursor_mode` (`CURSOR_*`), downgraded to what the portal offers. The
-    /// call returns once the portal (and any dialog it shows) has answered.
+    /// call returns once the portal (and any dialog it shows) has answered; a session the
+    /// portal created before a later step failed is closed before the error returns.
     pub fn open(
         capture: bool,
         devices: u32,
         cursor_mode: u32,
         restore_token: Option<&str>,
     ) -> Result<Self, String> {
-        let conn = Connection::session().map_err(|e| format!("session bus: {e}"))?;
+        zbus::block_on(async {
+            let mut this = Self::connect(devices, cursor_mode).await?;
+            if let Err(e) = this.start(capture, devices, restore_token).await {
+                this.close().await;
+                return Err(e);
+            }
+            this.armed = true;
+            Ok(this)
+        })
+    }
+
+    /// The session bus and the portal interfaces a session with `devices` speaks to, before
+    /// any session exists.
+    async fn connect(devices: u32, cursor_mode: u32) -> Result<Self, String> {
+        let conn = Connection::session()
+            .await
+            .map_err(|e| format!("session bus: {e}"))?;
         let screencast = Proxy::new(&conn, DESKTOP, DESKTOP_PATH, SCREENCAST_IFACE)
+            .await
             .map_err(|e| e.to_string())?;
-        let remote = (devices != 0)
-            .then(|| {
+        let remote = if devices != 0 {
+            Some(
                 Proxy::new(&conn, DESKTOP, DESKTOP_PATH, REMOTE_DESKTOP_IFACE)
-                    .map_err(|e| e.to_string())
-            })
-            .transpose()?;
-        let sc_version: u32 = screencast
-            .get_property("version")
-            .map_err(|e| format!("no ScreenCast portal: {e}"))?;
-        let mut this = Self {
+                    .await
+                    .map_err(|e| e.to_string())?,
+            )
+        } else {
+            None
+        };
+        Ok(Self {
             conn,
             screencast,
             remote,
@@ -189,138 +230,158 @@ impl PortalSession {
             restore_token: None,
             rd_version: 0,
             kde: false,
-        };
-        let opener = this
+            armed: false,
+        })
+    }
+
+    /// Create the session, select its sources and devices, and start it (`open`).
+    async fn start(
+        &mut self,
+        capture: bool,
+        devices: u32,
+        restore_token: Option<&str>,
+    ) -> Result<(), String> {
+        let sc_version: u32 = self
+            .screencast
+            .get_property("version")
+            .await
+            .map_err(|e| format!("no ScreenCast portal: {e}"))?;
+        let opener = self
             .remote
             .clone()
-            .unwrap_or_else(|| this.screencast.clone());
-        let rd_version: u32 = match &this.remote {
+            .unwrap_or_else(|| self.screencast.clone());
+        let rd_version: u32 = match &self.remote {
             Some(rd) => rd
                 .get_property("version")
+                .await
                 .map_err(|e| format!("no RemoteDesktop portal: {e}"))?,
             None => 0,
         };
-        this.rd_version = rd_version;
+        self.rd_version = rd_version;
         let mut options = Options::new();
         options.insert(
             "session_handle_token",
-            Value::from(format!("pixelflux{}", std::process::id())),
+            Variant::from(format!("pixelflux{}", std::process::id())),
         );
-        let (_, results) = this.request("CreateSession", options, |o| {
-            opener.call("CreateSession", &(o,))
-        })?;
+        let (_, results) = self
+            .request("CreateSession", options, async |o| {
+                opener.call("CreateSession", &(o,)).await
+            })
+            .await?;
         let session = results
             .get("session_handle")
             .and_then(|v| match &**v {
-                Value::Str(s) => OwnedObjectPath::try_from(s.as_str()).ok(),
-                Value::ObjectPath(p) => Some(p.clone().into()),
+                Variant::Str(s) => OwnedObjectPath::try_from(s.as_str()).ok(),
+                Variant::ObjectPath(p) => Some(p.clone().into()),
                 _ => None,
             })
             .ok_or("CreateSession returned no session handle")?;
-        this.session = session;
+        self.session = session;
 
         // Persistence rides SelectDevices on a remote-desktop session and SelectSources on a
         // plain screencast one; a backend without the option ignores it.
-        let persist_on_sources = this.remote.is_none() && sc_version >= 4;
-        let persist_on_devices = this.remote.is_some() && rd_version >= 2;
+        let persist_on_sources = self.remote.is_none() && sc_version >= 4;
+        let persist_on_devices = self.remote.is_some() && rd_version >= 2;
         if capture {
-            let available: u32 = this
+            let available: u32 = self
                 .screencast
                 .get_property("AvailableCursorModes")
+                .await
                 .unwrap_or(CURSOR_EMBEDDED);
-            if available & cursor_mode == 0 {
-                this.cursor_mode = [CURSOR_EMBEDDED, CURSOR_HIDDEN, CURSOR_METADATA]
+            if available & self.cursor_mode == 0 {
+                self.cursor_mode = [CURSOR_EMBEDDED, CURSOR_HIDDEN, CURSOR_METADATA]
                     .into_iter()
                     .find(|m| available & m != 0)
                     .unwrap_or(CURSOR_EMBEDDED);
             }
             let mut options = Options::new();
             opt_u32(&mut options, "types", SOURCE_MONITOR);
-            options.insert("multiple", Value::Bool(true));
+            options.insert("multiple", Variant::Bool(true));
             if sc_version >= 2 {
-                opt_u32(&mut options, "cursor_mode", this.cursor_mode);
+                opt_u32(&mut options, "cursor_mode", self.cursor_mode);
             }
             if persist_on_sources {
                 opt_u32(&mut options, "persist_mode", PERSIST_UNTIL_REVOKED);
                 if let Some(t) = restore_token {
-                    options.insert("restore_token", Value::from(t.to_string()));
+                    options.insert("restore_token", Variant::from(t.to_string()));
                 }
             }
-            let (sc, session) = (this.screencast.clone(), this.session.clone());
-            this.request("SelectSources", options, |o| {
-                sc.call("SelectSources", &(&session, o))
-            })?;
+            let (sc, session) = (self.screencast.clone(), self.session.clone());
+            self.request("SelectSources", options, async |o| {
+                sc.call("SelectSources", &(&session, o)).await
+            })
+            .await?;
         }
-        if let Some(rd) = this.remote.clone() {
+        if let Some(rd) = self.remote.clone() {
             let available: u32 = rd
                 .get_property("AvailableDeviceTypes")
+                .await
                 .unwrap_or(DEVICE_KEYBOARD | DEVICE_POINTER);
             let mut options = Options::new();
             opt_u32(&mut options, "types", devices & available);
             if persist_on_devices {
                 opt_u32(&mut options, "persist_mode", PERSIST_UNTIL_REVOKED);
                 if let Some(t) = restore_token {
-                    options.insert("restore_token", Value::from(t.to_string()));
+                    options.insert("restore_token", Variant::from(t.to_string()));
                 }
             }
-            let session = this.session.clone();
-            this.request("SelectDevices", options, |o| {
-                rd.call("SelectDevices", &(&session, o))
-            })?;
+            let session = self.session.clone();
+            self.request("SelectDevices", options, async |o| {
+                rd.call("SelectDevices", &(&session, o)).await
+            })
+            .await?;
         }
-        let session = this.session.clone();
-        let (_, results) = this.request("Start", Options::new(), |o| {
-            opener.call("Start", &(&session, "", o))
-        })?;
+        let session = self.session.clone();
+        let (_, results) = self
+            .request("Start", Options::new(), async |o| {
+                opener.call("Start", &(&session, "", o)).await
+            })
+            .await?;
         if let Some(v) = results.get("streams") {
-            this.streams = parse_streams(v);
+            self.streams = parse_streams(v);
         }
-        if let Some(Value::U32(d)) = results.get("devices").map(|v| &**v) {
-            this.devices = *d;
+        if let Some(Variant::U32(d)) = results.get("devices").map(|v| &**v) {
+            self.devices = *d;
         }
-        if let Some(Value::Str(t)) = results.get("restore_token").map(|v| &**v) {
-            this.restore_token = Some(t.to_string());
+        if let Some(Variant::Str(t)) = results.get("restore_token").map(|v| &**v) {
+            self.restore_token = Some(t.to_string());
             save_restore_token(t);
         }
-        if capture && this.streams.is_empty() {
+        if capture && self.streams.is_empty() {
             return Err("the portal started no monitor stream".into());
         }
         // The backend has answered Start, so it runs by now; the frontend names none.
-        this.kde = this.remote.is_some()
-            && zbus::blocking::fdo::DBusProxy::new(&this.conn)
-                .and_then(|bus| {
-                    bus.name_has_owner(
-                        "org.freedesktop.impl.portal.desktop.kde"
-                            .try_into()
-                            .map_err(zbus::Error::from)?,
-                    )
-                    .map_err(zbus::Error::from)
-                })
-                .unwrap_or(false);
-        Ok(this)
+        self.kde = self.remote.is_some() && kde_backend(&self.conn).await;
+        Ok(())
     }
 
     /// Whether a ScreenCast portal answers on the session bus; the error says which step
     /// did not, since a bus nobody listens on and a portal without a backend read the same.
     pub fn probe() -> Result<(), String> {
-        let conn = Connection::session().map_err(|e| format!("session bus: {e}"))?;
-        let screencast = Proxy::new(&conn, DESKTOP, DESKTOP_PATH, SCREENCAST_IFACE)
-            .map_err(|e| e.to_string())?;
-        screencast
-            .get_property::<u32>("version")
-            .map(|_| ())
-            .map_err(|e| format!("no ScreenCast portal: {e}"))
+        zbus::block_on(async {
+            let conn = Connection::session()
+                .await
+                .map_err(|e| format!("session bus: {e}"))?;
+            let screencast = Proxy::new(&conn, DESKTOP, DESKTOP_PATH, SCREENCAST_IFACE)
+                .await
+                .map_err(|e| e.to_string())?;
+            screencast
+                .get_property::<u32>("version")
+                .await
+                .map(|_| ())
+                .map_err(|e| format!("no ScreenCast portal: {e}"))
+        })
     }
 
     /// A method whose result arrives as a `Response` on a request object: subscribe to the
     /// request path the handle token names before the call `call` makes with the completed
     /// options, then wait for the answer.
-    fn request(
+    async fn request(
         &self,
         method: &str,
         mut options: Options<'_>,
-        call: impl FnOnce(&Options<'_>) -> zbus::Result<OwnedObjectPath>,
-    ) -> Result<(u32, HashMap<String, OwnedValue>), String> {
+        call: impl AsyncFnOnce(&Options<'_>) -> zbus::Result<OwnedObjectPath>,
+    ) -> Result<(u32, HashMap<String, OwnedVariant>), String> {
         static COUNTER: AtomicU32 = AtomicU32::new(1);
         let token = format!(
             "pixelflux{}_{}",
@@ -334,25 +395,31 @@ impl PortalSession {
             .as_str()
             .to_string();
         let path = request_path(&sender, &token);
-        options.insert("handle_token", Value::from(token.clone()));
+        options.insert("handle_token", Variant::from(token.clone()));
         let request = Proxy::new(&self.conn, DESKTOP, path.as_str(), REQUEST_IFACE)
+            .await
             .map_err(|e| e.to_string())?;
         let mut responses = request
             .receive_signal("Response")
+            .await
             .map_err(|e| e.to_string())?;
-        let handle = call(&options).map_err(|e| format!("{method}: {e}"))?;
+        let handle = call(&options)
+            .await
+            .map_err(|e| format!("{method}: {e}"))?;
         if handle.as_str() != path {
             // A portal predating handle tokens answers on the path it returned.
             let request = Proxy::new(&self.conn, DESKTOP, handle.as_str(), REQUEST_IFACE)
+                .await
                 .map_err(|e| e.to_string())?;
             responses = request
                 .receive_signal("Response")
+                .await
                 .map_err(|e| e.to_string())?;
         }
-        let msg = responses
-            .next()
+        let msg = next_message(&mut responses)
+            .await
             .ok_or_else(|| format!("{method}: the request closed without a response"))?;
-        let (code, results): (u32, HashMap<String, OwnedValue>) = msg
+        let (code, results): (u32, HashMap<String, OwnedVariant>) = msg
             .body()
             .deserialize()
             .map_err(|e| format!("{method}: {e}"))?;
@@ -374,31 +441,30 @@ impl PortalSession {
     /// only when the injector is committed to.
     pub fn connect_to_eis(&self) -> Result<OwnedFd, String> {
         let rd = self.remote.as_ref().ok_or("session drives no input")?;
-        let fd: zbus::zvariant::OwnedFd = rd
-            .call("ConnectToEIS", &(self.session.clone(), Options::new()))
-            .map_err(|e| format!("ConnectToEIS: {e}"))?;
+        let fd: zbus::OwnedFd = zbus::block_on(
+            rd.call("ConnectToEIS", &(self.session.clone(), Options::new())),
+        )
+        .map_err(|e| format!("ConnectToEIS: {e}"))?;
         Ok(fd.into())
     }
 
     /// The PipeWire connection the streams live on, opened by the portal with the node
     /// permissions of this session.
     pub fn open_pipewire_remote(&self) -> Result<OwnedFd, String> {
-        let fd: zbus::zvariant::OwnedFd = self
-            .screencast
-            .call(
-                "OpenPipeWireRemote",
-                &(self.session.clone(), Options::new()),
-            )
-            .map_err(|e| format!("OpenPipeWireRemote: {e}"))?;
+        let fd: zbus::OwnedFd = zbus::block_on(self.screencast.call(
+            "OpenPipeWireRemote",
+            &(self.session.clone(), Options::new()),
+        ))
+        .map_err(|e| format!("OpenPipeWireRemote: {e}"))?;
         Ok(fd.into())
     }
 
     fn notify<B>(&self, method: &str, args: &B)
     where
-        B: serde::Serialize + zbus::zvariant::DynamicType,
+        B: serde::Serialize + zbus::DynamicType,
     {
         if let Some(rd) = &self.remote {
-            let _ = rd.call_noreply(method, args);
+            let _ = zbus::block_on(rd.call_noreply(method, args));
         }
     }
 
@@ -431,7 +497,7 @@ impl PortalSession {
     /// GNOME's passes both on, so it is handed the axis negated.
     pub fn pointer_axis(&self, dx: f64, dy: f64, finish: bool) {
         let mut options = Options::new();
-        options.insert("finish", Value::Bool(finish));
+        options.insert("finish", Variant::Bool(finish));
         let dy = if self.kde { -dy } else { dy };
         self.notify(
             "NotifyPointerAxis",
@@ -468,10 +534,21 @@ impl PortalSession {
     }
 }
 
+impl PortalSession {
+    /// Close the session on the portal, if one was created.
+    async fn close(&self) {
+        if let Ok(session) =
+            Proxy::new(&self.conn, DESKTOP, self.session.as_str(), SESSION_IFACE).await
+        {
+            let _ = session.call_noreply("Close", &()).await;
+        }
+    }
+}
+
 impl Drop for PortalSession {
     fn drop(&mut self) {
-        if let Ok(session) = Proxy::new(&self.conn, DESKTOP, self.session.as_str(), SESSION_IFACE) {
-            let _ = session.call_noreply("Close", &());
+        if self.armed {
+            zbus::block_on(self.close());
         }
     }
 }
@@ -487,23 +564,23 @@ fn request_path(sender: &str, token: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zbus::zvariant::{Array, Dict, Structure, StructureBuilder};
+    use zbus::Type as _;
+    use zbus::wire::StructureBuilder;
+    use zbus::{Array, Dict, Structure};
 
-    fn stream_value(node: u32, props: Vec<(&'static str, Value<'static>)>) -> Value<'static> {
-        let mut dict = Dict::new(<&str>::SIGNATURE, Value::SIGNATURE);
+    fn stream_value(node: u32, props: Vec<(&'static str, Variant<'static>)>) -> Variant<'static> {
+        let mut dict = Dict::new(<&str>::SIGNATURE, Variant::SIGNATURE);
         for (k, v) in props {
-            dict.append(Value::from(k), Value::Value(Box::new(v)))
+            dict.append(Variant::from(k), Variant::Variant(Box::new(v)))
                 .unwrap();
         }
         let st: Structure = StructureBuilder::new()
             .add_field(node)
-            .append_field(Value::Dict(dict))
+            .append_field(Variant::Dict(dict))
             .build()
             .unwrap();
-        Value::Structure(st)
+        Variant::Structure(st)
     }
-
-    use zbus::zvariant::Type as _;
 
     /// A `Start` response's stream list parses into node ids with the optional geometry, as
     /// KDE (size only) and GNOME (position and size) send it.
@@ -512,21 +589,21 @@ mod tests {
         let kde = stream_value(
             113,
             vec![
-                ("size", Value::from((1280i32, 720i32))),
-                ("source_type", Value::U32(1)),
+                ("size", Variant::from((1280i32, 720i32))),
+                ("source_type", Variant::U32(1)),
             ],
         );
         let gnome = stream_value(
             42,
             vec![
-                ("position", Value::from((1920i32, 0i32))),
-                ("size", Value::from((1280i32, 720i32))),
+                ("position", Variant::from((1920i32, 0i32))),
+                ("size", Variant::from((1280i32, 720i32))),
             ],
         );
         let mut arr = Array::new(&kde.value_signature().clone());
         arr.append(kde).unwrap();
         arr.append(gnome).unwrap();
-        let streams = parse_streams(&Value::Array(arr));
+        let streams = parse_streams(&Variant::Array(arr));
         assert_eq!(
             streams,
             vec![

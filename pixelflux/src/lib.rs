@@ -7959,24 +7959,28 @@ mod join_tests {
 /// or without a system bus at all as a container is, leaves the thread at the default, said
 /// once in the log.
 pub(crate) fn boost_thread_priority(nice: libc::c_int) {
-    static RTKIT: OnceLock<zbus::Result<zbus::blocking::Connection>> = OnceLock::new();
+    static RTKIT: OnceLock<zbus::Result<zbus::Connection>> = OnceLock::new();
     static REFUSED: std::sync::Once = std::sync::Once::new();
     let tid = unsafe { libc::syscall(libc::SYS_gettid) };
     if unsafe { libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, nice) } == 0 {
         return;
     }
     let granted = RTKIT
-        .get_or_init(zbus::blocking::Connection::system)
+        .get_or_init(|| zbus::block_on(zbus::Connection::system()))
         .as_ref()
         .map_err(|e| e.to_string())
         .and_then(|conn| {
-            zbus::blocking::Proxy::new(
-                conn,
-                "org.freedesktop.RealtimeKit1",
-                "/org/freedesktop/RealtimeKit1",
-                "org.freedesktop.RealtimeKit1",
-            )
-            .and_then(|rtkit| rtkit.call_method("MakeThreadHighPriority", &(tid as u64, nice)))
+            zbus::block_on(async {
+                zbus::Proxy::new(
+                    conn,
+                    "org.freedesktop.RealtimeKit1",
+                    "/org/freedesktop/RealtimeKit1",
+                    "org.freedesktop.RealtimeKit1",
+                )
+                .await?
+                .call_method("MakeThreadHighPriority", &(tid as u64, nice))
+                .await
+            })
             .map(|_| ())
             .map_err(|e| e.to_string())
         });
