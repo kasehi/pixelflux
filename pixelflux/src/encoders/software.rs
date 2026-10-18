@@ -1294,6 +1294,11 @@ impl FrameTiming {
 const MIN_STRIPE_HEIGHT: i32 = 64;
 /// The frames the stripes' cleanups of one still screen are spread over (`encode_cpu`).
 const CLEANUP_STAGGER_FRAMES: usize = 4;
+/// The least of a constant rate a stripe refining a still screen through x264's rate control is
+/// given, in kbit/s: on shares of 62 to 100 x264 coded slice headers alone until each cleanup
+/// ended (`pipeline::EMPTY_S`), seven of eight stripes of a page left at 14 dB at 0.5 Mbit/s,
+/// where 250 refined every stripe at 30 and 60 fps.
+const REFINE_STRIPE_KBPS: i32 = 250;
 /// How fast the smoothed count of budget-carrying stripes follows the frame's.
 const CARRY_RISE: f32 = 0.3;
 const CARRY_FALL: f32 = 0.05;
@@ -1614,8 +1619,19 @@ pub fn encode_cpu(
     }
 
     // A still screen reaches every stripe's cleanup on the same frame; spread them over
-    // `CLEANUP_STAGGER_FRAMES` frames so no one frame carries the whole screen's.
+    // `CLEANUP_STAGGER_FRAMES` frames so no one frame carries the whole screen's. Under a constant
+    // rate the stripes refining share one budget, so no more refine at once than it feeds at
+    // `REFINE_STRIPE_KBPS` a stripe; the rest wait their turn.
     let per_frame = stripes.len().div_ceil(CLEANUP_STAGGER_FRAMES).max(1);
+    let refine_slots = if converges {
+        refine_slots(settings, stripes.len())
+    } else {
+        stripes.len()
+    };
+    let refining = stripes
+        .iter()
+        .filter(|st| converges && st.h264_burst_frames_remaining > 0)
+        .count();
     let mut granted = 0;
     let cleanup_allowed: Vec<bool> = stripes
         .iter()
@@ -1630,7 +1646,7 @@ pub fn encode_cpu(
                 return true;
             }
             granted += 1;
-            granted <= per_frame
+            granted <= per_frame && refining + granted <= refine_slots
         })
         .collect();
 
@@ -2157,6 +2173,12 @@ fn cleanup_vbv_kbit(settings: &RustCaptureSettings, bitrate_kbps: i32) -> i32 {
     frames.max(seconds).max(1) as i32
 }
 
+/// How many stripes refine a still screen through x264's rate control at once: as many as the
+/// session's rate gives `REFINE_STRIPE_KBPS` each, one at least.
+fn refine_slots(settings: &RustCaptureSettings, n_stripes: usize) -> usize {
+    ((settings.video_bitrate_kbps / REFINE_STRIPE_KBPS).max(1) as usize).min(n_stripes.max(1))
+}
+
 /// Split the configured rate budget across the stripes carrying it, returning the
 /// `(bitrate_kbps, vbv_kbit)` each stripe's encoder is programmed with: the CBR target, or the
 /// peak of a CRF a positive `video_vbv_multiplier` caps. An uncapped CRF gets a buffer of 0.
@@ -2299,6 +2321,29 @@ mod tests {
                 "each stripe's buffer is its share of the whole-screen one: {share}x8 vs {whole}"
             );
         }
+    }
+
+    /// Stripes clean up through the rate control as many at a time as the session's rate gives
+    /// `REFINE_STRIPE_KBPS` each, one at least and never more than there are: two of eight at
+    /// 0.5 Mbit/s, all eight from 2 Mbit/s.
+    #[test]
+    fn stripes_refine_as_many_at_once_as_the_rate_feeds() {
+        use crate::RustCaptureSettings;
+        let slots = |kbps| {
+            super::refine_slots(
+                &RustCaptureSettings {
+                    video_cbr_mode: true,
+                    video_bitrate_kbps: kbps,
+                    ..Default::default()
+                },
+                8,
+            )
+        };
+        assert_eq!(slots(100), 1);
+        assert_eq!(slots(500), 2);
+        assert_eq!(slots(1000), 4);
+        assert_eq!(slots(2000), 8);
+        assert_eq!(slots(20000), 8);
     }
 
     /// A CRF stripe is capped only where a VBV multiplier asks for it, with the whole-screen
