@@ -137,7 +137,9 @@ fn parse_streams(v: &Variant<'_>) -> Vec<PortalStream> {
     let mut out = Vec::new();
     let Variant::Array(arr) = v else { return out };
     for item in arr.iter() {
-        let Variant::Structure(s) = item else { continue };
+        let Variant::Structure(s) = item else {
+            continue;
+        };
         let fields = s.fields();
         let Some(Variant::U32(node_id)) = fields.first() else {
             continue;
@@ -403,9 +405,7 @@ impl PortalSession {
             .receive_signal("Response")
             .await
             .map_err(|e| e.to_string())?;
-        let handle = call(&options)
-            .await
-            .map_err(|e| format!("{method}: {e}"))?;
+        let handle = call(&options).await.map_err(|e| format!("{method}: {e}"))?;
         if handle.as_str() != path {
             // A portal predating handle tokens answers on the path it returned.
             let request = Proxy::new(&self.conn, DESKTOP, handle.as_str(), REQUEST_IFACE)
@@ -441,10 +441,9 @@ impl PortalSession {
     /// only when the injector is committed to.
     pub fn connect_to_eis(&self) -> Result<OwnedFd, String> {
         let rd = self.remote.as_ref().ok_or("session drives no input")?;
-        let fd: zbus::OwnedFd = zbus::block_on(
-            rd.call("ConnectToEIS", &(self.session.clone(), Options::new())),
-        )
-        .map_err(|e| format!("ConnectToEIS: {e}"))?;
+        let fd: zbus::OwnedFd =
+            zbus::block_on(rd.call("ConnectToEIS", &(self.session.clone(), Options::new())))
+                .map_err(|e| format!("ConnectToEIS: {e}"))?;
         Ok(fd.into())
     }
 
