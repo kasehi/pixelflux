@@ -106,6 +106,10 @@ pub struct VpxEncoder {
     /// The size and quality index of the last held key frame of a constant-rate session
     /// (`super::held_key_start`).
     held_key: Option<(usize, u32)>,
+    /// The bytes the next frame, a still screen's cleanup, may come to (`cap`, VP9).
+    cap: Option<usize>,
+    /// Whether the rate control runs at a cleanup frame's rate, to be put back.
+    raised: bool,
 }
 
 unsafe impl Send for VpxEncoder {}
@@ -209,6 +213,8 @@ impl VpxEncoder {
             band_map: Vec::new(),
             last_quality: None,
             last_bytes: None,
+            cap: None,
+            raised: false,
             held_key: None,
         };
         let q = me.quality.current;
@@ -408,6 +414,24 @@ impl VpxEncoder {
         self.last_quality
     }
 
+    /// Whether a still screen's cleanup frame is coded at the rate its cap runs at (`cap`): VP9
+    /// at a constant rate, whose cleanup runs through its rate control, which takes a new target
+    /// live.
+    pub fn follows_cap(&self) -> bool {
+        self.codec == Codec::Vp9 && self.rate.cbr
+    }
+
+    /// Code the next frame, a still screen's cleanup, at the rate that spends `bytes` in
+    /// `pipeline::CLEANUP_FRAME_S`, its buffer as long in time as the session's; the frame after
+    /// goes back to the session's rate. At 60 fps 0.5 Mbit/s VP9 refined 1080p text by 1 dB a
+    /// second at its own rate (32.5 dB 8 s after the stop), and to 55 dB in 8 s at a 2 Mbit/s
+    /// path's.
+    pub fn cap(&mut self, bytes: usize) {
+        if self.follows_cap() {
+            self.cap = Some(bytes);
+        }
+    }
+
     /// The bytes of the last frame the rate control coded, held frames aside, where a
     /// constant-rate cleanup runs through that rate control (`holds_quantizer`).
     pub fn last_size(&self) -> Option<usize> {
@@ -530,6 +554,22 @@ impl VpxEncoder {
         {
             self.program_rate(self.rate, q);
             self.reconfigure()?;
+        }
+        if let Some(bytes) = self.cap.take() {
+            let kbps = ((bytes as f64 * 8.0 / crate::pipeline::CLEANUP_FRAME_S / 1000.0) as u32)
+                .max((self.rate.bps() / 1000) as u32);
+            if kbps != self.cfg.rc_target_bitrate {
+                self.cfg.rc_target_bitrate = kbps;
+                self.cfg.ss_target_bitrate[0] = kbps;
+                self.cfg.ts_target_bitrate[..VP9_LAYERS as usize].fill(kbps);
+                self.cfg.layer_target_bitrate[..VP9_LAYERS as usize].fill(kbps);
+                self.reconfigure()?;
+            }
+            self.raised = true;
+        } else if self.raised {
+            self.program_rate(self.rate, self.quality.current);
+            self.reconfigure()?;
+            self.raised = false;
         }
         let capped = force_idr && self.rate.cbr;
         let cap = (self.rate.bps() as f64 / 8.0 * super::HELD_KEY_BUDGET_S) as usize;
@@ -1129,6 +1169,33 @@ mod tests {
         s.video_bitrate_kbps = 5;
         let starved = VpxEncoder::new(&s, Codec::Vp8, false).expect("session");
         assert_eq!(starved.band_size(), None);
+    }
+
+    /// A VP9 cleanup frame capped at `bytes` is coded at the rate that spends them in the
+    /// cleanup's frame time, the frame after at the session's again; VP8, which holds its cleanup
+    /// at a quantizer, keeps its rate.
+    #[test]
+    fn a_vp9_cleanup_frame_runs_at_its_caps_rate_and_the_next_at_the_sessions() {
+        for codec in [Codec::Vp8, Codec::Vp9] {
+            let mut s = settings(codec);
+            s.video_cbr_mode = true;
+            s.video_bitrate_kbps = 500;
+            let mut enc = VpxEncoder::new(&s, codec, false).expect("session");
+            enc.encode_host(&frame(0), W * 4, false, 0, 25, true)
+                .unwrap();
+            enc.cap(400_000);
+            enc.encode_host(&frame(0), W * 4, false, 1, 25, false)
+                .unwrap();
+            let raised = enc.cfg.rc_target_bitrate;
+            enc.encode_host(&frame(0), W * 4, false, 2, 25, false)
+                .unwrap();
+            let after = enc.cfg.rc_target_bitrate;
+            if codec == Codec::Vp9 {
+                assert_eq!((raised, after), (16_000, 500));
+            } else {
+                assert_eq!((raised, after), (500, 500), "{codec:?}");
+            }
+        }
     }
 
     #[test]

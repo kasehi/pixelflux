@@ -1274,16 +1274,19 @@ impl FrameEncoder {
         match self {
             FrameEncoder::Nvenc(enc) => enc.cap(bytes),
             FrameEncoder::Vaapi(enc) => enc.cap(bytes),
+            FrameEncoder::Vpx(enc) => enc.cap(bytes),
             _ => {}
         }
     }
 
     /// Whether a still screen's cleanup frame is coded at the rate its cap runs at (`cap`), so
     /// the cleanup judges it against that rate's budget: VA-API at a constant rate, which takes
-    /// a new target with a picture. NVENC takes a frame back instead.
+    /// a new target with a picture, and libvpx's VP9, which takes one live. NVENC takes a frame
+    /// back instead.
     pub fn follows_cap(&self) -> bool {
         match self {
             FrameEncoder::Vaapi(enc) => enc.follows_cap(),
+            FrameEncoder::Vpx(enc) => enc.follows_cap(),
             _ => false,
         }
     }
