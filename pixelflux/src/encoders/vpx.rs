@@ -59,6 +59,16 @@ const VP8_TOKEN_PARTITIONS: c_int = VP8_EIGHT_TOKENPARTITION as c_int;
 /// The frame budget a macroblock, in bits, from which VP8 sweeps its refresh in bands
 /// (`VpxEncoder::band_size`): three times what a frame that skips every macroblock costs.
 const BAND_BITS_PER_MB: f64 = 1.0;
+/// The finest VP8 quantizer indices, at and under which a held band is coded with no loop filter
+/// (`band_roi`), as libvpx itself filters a frame there at level 1 at most. libvpx starts a
+/// frame's level from the last frame's and keeps it while a strip across the middle of the
+/// picture shows no gain, which a band elsewhere leaves as it was: the bands above the middle of
+/// a sweep after motion kept the level its coarse frames left (46), and 1080p text swept at
+/// index 2 ended at 42.7 dB at 8 fps 2 Mbit/s against 50.6 unfiltered, at 15 fps 43.6 against
+/// 50.6, at 30 and 60 fps level. At coarser indices libvpx's level stands, unfiltered coming out
+/// 0.2 to 0.4 dB short at 24 and 73. A refresh held whole shows the strip, and libvpx's level
+/// came out 0.3 to 0.8 dB finer than none at index 3.
+const VP8_UNFILTERED_QINDEX: u32 = 16;
 
 /// Whether the loaded libvpx codes VP9 4:4:4 in the flexible mode the sessions run: before 1.13
 /// its layer machinery re-sizes every frame at 4:2:0, so a profile 1 session writes headers
@@ -481,12 +491,13 @@ impl VpxEncoder {
     /// Hand libvpx the region map of a held band (`band`, from and to in raster order of the
     /// macroblocks, as NVENC's delta map counts them), or clear it with `None`. The band is
     /// coded at the frame's own quantizer, the one held, with the static threshold the session
-    /// keeps (`VP8_STATIC_THRESHOLD`); every other macroblock is skipped, a static threshold
+    /// keeps (`VP8_STATIC_THRESHOLD`) and, where `unfiltered`, no loop filter
+    /// (`VP8_UNFILTERED_QINDEX`); every other macroblock is skipped, a static threshold
     /// no prediction error reaches making it a copy of the reference, so the frame carries the
     /// band and nothing else. VP8's segments take a quantizer delta of 63 at most, so the band
     /// is not held finer than a coarse rest the way NVENC's map holds it: the rest is skipped
     /// outright, which no quantizer of its own would do better.
-    fn band_roi(&mut self, band: Option<(f64, f64)>) -> Result<(), String> {
+    fn band_roi(&mut self, band: Option<(f64, f64)>, unfiltered: bool) -> Result<(), String> {
         let cols = self.cfg.g_w.div_ceil(16);
         let rows = self.cfg.g_h.div_ceil(16);
         let mut roi: vpx_roi_map_t = unsafe { std::mem::zeroed() };
@@ -503,6 +514,9 @@ impl VpxEncoder {
             roi.delta_q[0] = 63;
             // No loop filter either, which would still touch a skipped block's edges.
             roi.delta_lf[0] = -63;
+            if unfiltered {
+                roi.delta_lf[1] = -63;
+            }
             roi.static_threshold[0] = u32::MAX >> 1;
             roi.static_threshold[1] = VP8_STATIC_THRESHOLD as u32;
         }
@@ -594,12 +608,14 @@ impl VpxEncoder {
             .take()
             .filter(|_| held.is_some() && !force_idr);
         if band.is_some() {
-            self.band_roi(band)?;
+            let unfiltered =
+                held.is_some_and(|crf| self.codec.quantizer(crf as i32) <= VP8_UNFILTERED_QINDEX);
+            self.band_roi(band, unfiltered)?;
         }
         let quality = self.last_quality;
         let mut result = self.encode_frame(pixels, stride, rgba, frame_number, force_idr);
         if band.is_some() {
-            self.band_roi(None)?;
+            self.band_roi(None, false)?;
         }
         let mut coded_at = held;
         let retry = match (held, &result) {
@@ -1169,6 +1185,59 @@ mod tests {
         s.video_bitrate_kbps = 5;
         let starved = VpxEncoder::new(&s, Codec::Vp8, false).expect("session");
         assert_eq!(starved.band_size(), None);
+    }
+
+    /// A VP8 band held at a fine quantizer after coarse motion decodes as close to the picture as
+    /// the quantizer codes it: it is not loop-filtered at the level the motion's frames left.
+    #[test]
+    fn a_vp8_band_after_coarse_motion_is_as_sharp_as_its_quantizer() {
+        let mut s = settings(Codec::Vp8);
+        s.video_cbr_mode = true;
+        s.video_bitrate_kbps = 30;
+        // The picture scrolled a few rows a frame.
+        let scrolled = |t: usize| {
+            let f = frame(0);
+            let rows = W * 4;
+            let shift = (t * 5) % H;
+            [&f[shift * rows..], &f[..shift * rows]].concat()
+        };
+        let still = scrolled(12);
+        // Its luma as VP8 codes it: BT.601, limited range.
+        let source: Vec<u8> = still
+            .chunks(4)
+            .map(|p| {
+                let (b, g, r) = (p[0] as f64, p[1] as f64, p[2] as f64);
+                (16.0 + (65.481 * r + 128.553 * g + 24.966 * b) / 255.0).round() as u8
+            })
+            .collect();
+        let mut enc = VpxEncoder::new(&s, Codec::Vp8, false).expect("session");
+        let mut dec = VideoDecoder::new(Codec::Vp8).unwrap();
+        for t in 0..12u64 {
+            let f = enc
+                .encode_host(&scrolled(t as usize), W * 4, false, t, 25, t == 0)
+                .unwrap();
+            assert!(dec.decode(&f[VIDEO_HEADER_LEN..]).unwrap());
+        }
+        // The top quarter, away from the middle of the picture.
+        enc.hold_quantizer(5, Some((0.0, 0.25)));
+        let held = enc
+            .encode_host(&still, W * 4, false, 12, 25, false)
+            .unwrap();
+        assert!(dec.decode(&held[VIDEO_HEADER_LEN..]).unwrap());
+        let off = rows_distance(&luma(&dec), &source, 0..48);
+        // A key frame of the picture at the same quantizer, from a session with no motion behind it.
+        let mut fresh = VpxEncoder::new(&settings(Codec::Vp8), Codec::Vp8, false).expect("session");
+        let mut fresh_dec = VideoDecoder::new(Codec::Vp8).unwrap();
+        fresh.hold_quantizer(5, None);
+        let key = fresh
+            .encode_host(&still, W * 4, false, 0, 25, true)
+            .unwrap();
+        assert!(fresh_dec.decode(&key[VIDEO_HEADER_LEN..]).unwrap());
+        let floor = rows_distance(&luma(&fresh_dec), &source, 0..48);
+        assert!(
+            off < floor + 0.2,
+            "the band decodes {off:.2} off the picture, a key frame at its quantizer {floor:.2}"
+        );
     }
 
     /// A VP9 cleanup frame capped at `bytes` is coded at the rate that spends them in the
