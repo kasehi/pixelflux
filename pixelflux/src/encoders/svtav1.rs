@@ -48,6 +48,15 @@ const PRESET: i8 = 11;
 /// takes a preset change only toward a faster one, and codes every other frame at `PRESET`.
 const ANCHOR_PRESET: i8 = 10;
 
+/// The preset a constant-rate session opens at, which codes a still screen's held key frame with
+/// the screen-content mode on (`scm`): the real-time mode keeps the palette there and leaves it
+/// off from preset 9 (intra block copy it leaves off throughout). 1080p text at quantizer 40 took
+/// 229 kB against 296 at preset 10; the held key frame came out 284-327 kB at 49.2-50.4 dB against
+/// 610-640 kB at 47.2-48.2 at preset 11, in about half a second. The session's first key frame
+/// and every other frame keep their own presets: the library takes a picture's preset change
+/// within the open one's and faster.
+const KEY_PRESET: i8 = 8;
+
 /// The highest constant-rate target the library takes, at open and live alike.
 const MAX_BITRATE_BPS: u64 = 100_000_000;
 
@@ -191,7 +200,7 @@ impl SvtAv1Encoder {
         let tracks = HAS_EVENTS && rate.cbr;
         {
             let cfg = &mut *self.config;
-            cfg.enc_mode = if tracks { ANCHOR_PRESET } else { PRESET };
+            cfg.enc_mode = if tracks { KEY_PRESET } else { PRESET };
             self.preset = cfg.enc_mode;
             cfg.source_width = self.planes.width as u32;
             cfg.source_height = self.planes.height as u32;
@@ -238,6 +247,7 @@ impl SvtAv1Encoder {
         self.set("lp", &self.threads.min(6).to_string())?;
         if tracks {
             self.set("hierarchical-levels", "0")?;
+            self.set("scm", "1")?;
         }
         if rate.cbr {
             self.set("rc", "2")?;
@@ -478,6 +488,21 @@ impl SvtAv1Encoder {
         }
         if self.rate.cbr && HAS_EVENTS {
             let held_key = key && self.held.is_some();
+            // The held key frame at the open preset; any other at its own, as the references
+            // planned it, or the anchor one where the session names none.
+            let preset = if held_key {
+                Some(KEY_PRESET)
+            } else if self.references.is_none() {
+                Some(ANCHOR_PRESET)
+            } else {
+                None
+            };
+            if let Some(preset) = preset
+                && preset != self.preset
+            {
+                self.events.preset = preset;
+                self.preset = preset;
+            }
             if held_key || self.restate_target {
                 // The rate control takes no quantizer: a held key frame's picture is planned
                 // with a target that gives it `HELD_KEY_BUDGET_S` of the session's.
@@ -626,6 +651,42 @@ mod tests {
                 (num, den)
             );
         }
+    }
+
+    /// A constant-rate session that manages its presets opens at `KEY_PRESET` with the
+    /// screen-content mode on, codes a still screen's held key frame there, and every other
+    /// frame, its first key frame included, at its own.
+    #[test]
+    fn a_held_key_frame_is_coded_at_the_key_preset_and_no_other_frame_is() {
+        if !HAS_EVENTS {
+            return;
+        }
+        let settings = RustCaptureSettings {
+            width: 64,
+            height: 64,
+            target_fps: 30.0,
+            codec: Codec::Av1,
+            video_cbr_mode: true,
+            video_bitrate_kbps: 2000,
+            ..Default::default()
+        };
+        let mut enc = SvtAv1Encoder::new(&settings, false).expect("session");
+        assert_eq!(enc.config.enc_mode, KEY_PRESET);
+        assert_eq!(enc.config.screen_content_mode, 1);
+        let frame = vec![0x40u8; 64 * 64 * 4];
+        enc.encode_host(&frame, 64 * 4, false, 0, 30, true)
+            .expect("first frame");
+        assert_ne!(enc.preset, KEY_PRESET, "the first key frame");
+        enc.encode_host(&frame, 64 * 4, false, 1, 30, false)
+            .expect("a frame");
+        assert_ne!(enc.preset, KEY_PRESET);
+        enc.hold_quantizer(10);
+        enc.encode_host(&frame, 64 * 4, false, 2, 30, true)
+            .expect("held key frame");
+        assert_eq!(enc.preset, KEY_PRESET);
+        enc.encode_host(&frame, 64 * 4, false, 3, 30, false)
+            .expect("the frame after");
+        assert_ne!(enc.preset, KEY_PRESET);
     }
 
     /// Sessions opened and closed on many threads at once each encode their frame.
