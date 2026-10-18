@@ -71,6 +71,39 @@ use crate::RustCaptureSettings;
 const SLICES: u32 = 4;
 /// The bytes a coded buffer holds: the uncompressed picture and some, an upper bound on any
 /// frame.
+/// The frame budget, in bits a pixel, under which radeonsi's rate control cannot refine a still
+/// screen it says no quantizer of, so the cleanup ends on a key frame (`refines`). 1080p text,
+/// pixelflux alone, the cleanup through the rate control at 0.004 / 0.008 / 0.016 / 0.03 / 0.12
+/// bits a pixel a frame: H.264 18.0 (60 fps 0.5 Mbit/s) / 30.0-38.2 / 40.1-52.6 / 43.4 / 56.4
+/// dB, HEVC 29.1 / - / 46.2 / 33.1 / -, each the full 10 s at the session's rate (2.1 MB at 60
+/// fps 2 Mbit/s); a key frame at `HELD_KEY_BITS_PER_PIXEL` came to 51.5 dB (H.264) and 47.1
+/// (HEVC) on 0.4-0.55 MB.
+const REFINE_BITS_PER_PIXEL: f64 = 0.04;
+
+/// The bits a pixel a held key frame of a constant rate is given at least (`held_key_bits`):
+/// VCE spends a frame's budget down the picture and codes the rows it runs out on at its
+/// coarsest, so a key frame short of what the picture needs at the paint-over quality comes
+/// out sharp at the top and smeared below: 1080p text in 0.8 bits a pixel came to 271 kB at
+/// 25.5 dB (H.264, 52 dB in the top rows, 18 in the bottom ones) and 307 kB at 39.0 (HEVC), in
+/// 1.6 to 463 kB at 51.5 and 380 kB at 47.1. The driver's best quality level for the key frame
+/// changed nothing.
+const HELD_KEY_BITS_PER_PIXEL: f64 = 1.6;
+
+/// Whether a constant rate of `bps` at `fps` gives a `width` x `height` frame the budget
+/// radeonsi's rate control refines a still screen in (`REFINE_BITS_PER_PIXEL`).
+fn refines(bps: u32, fps: f64, width: u32, height: u32) -> bool {
+    let pixels = f64::from(width) * f64::from(height);
+    f64::from(bps) / fps.max(1.0) >= REFINE_BITS_PER_PIXEL * pixels.max(1.0)
+}
+
+/// The bits a key frame held at a constant rate of `bps` is given for a `width` x `height`
+/// picture: `HELD_KEY_BUDGET_S` of the rate, and at least `HELD_KEY_BITS_PER_PIXEL`, the
+/// maintainer's rule that a key frame is capped only where the cap leaves the picture good.
+fn held_key_bits(bps: u32, width: u32, height: u32) -> f64 {
+    let pixels = f64::from(width) * f64::from(height);
+    (f64::from(bps) * crate::encoders::HELD_KEY_BUDGET_S).max(HELD_KEY_BITS_PER_PIXEL * pixels)
+}
+
 fn coded_buffer_size(width: u32, height: u32) -> u32 {
     3 * width * height + (1 << 16)
 }
@@ -1823,6 +1856,23 @@ impl VaapiEncoder {
         }
     }
 
+    /// Whether a constant-rate cleanup ends on a key frame held at the paint-over quantizer
+    /// (`FrameEncoder::ends_cleanup_on_key`): where the driver says no quantizer of its H.264 or
+    /// HEVC frames (radeonsi) and the session's frame budget is under
+    /// `REFINE_BITS_PER_PIXEL` (`refines`).
+    pub fn ends_cleanup_on_key(&self) -> bool {
+        self.rate.cbr
+            && matches!(self.arm, Arm::H264(_) | Arm::H265(_))
+            && self.last_bytes.is_some()
+            && self.last_quality.is_none()
+            && !refines(
+                self.negotiated.bits_per_second,
+                self.negotiated.fps.fps(),
+                self.negotiated.width,
+                self.negotiated.height,
+            )
+    }
+
     /// Whether a still screen's cleanup frame is coded at the rate its cap runs at (`cap`): at
     /// a constant rate, where the driver takes a new target with a picture.
     pub fn follows_cap(&self) -> bool {
@@ -1849,7 +1899,9 @@ impl VaapiEncoder {
     /// small buffer, 26 dB), and a key frame given a budget of its own through a restarted rate
     /// control came out coarser than the picture the driver's rate control refines a still
     /// screen to by itself (51 against 61 dB at 8 Mbit/s), so `FrameEncoder::holds_quantizer`
-    /// says no there.
+    /// says no there. A key frame held there, the cleanup of a session whose rate control
+    /// cannot refine (`ends_cleanup_on_key`), is coded with the budget `held_key_bits` gives it,
+    /// sent with the picture.
     pub fn hold_quantizer(&mut self, crf: u32) {
         self.held = Some(
             self.codec
@@ -2319,10 +2371,20 @@ impl VaapiEncoder {
             slot_surfaces,
         };
         let mut out = Buffers::new();
-        let bps = self
+        let mut bps = self
             .cleanup_bps
             .take()
             .unwrap_or(self.negotiated.bits_per_second);
+        if self.rate.cbr && key && held_qp.is_some() {
+            // A held key frame's budget, as one frame's of a rate sent with it.
+            let fps = self.negotiated.fps.fps().max(1.0);
+            let bits = held_key_bits(
+                self.negotiated.bits_per_second,
+                self.negotiated.width,
+                self.negotiated.height,
+            );
+            bps = (bits * fps).min(u32::MAX as f64) as u32;
+        }
         if key {
             self.arm.sequence(&self.negotiated, &mut out);
             self.rate_control_at(&mut out, bps);
@@ -2625,6 +2687,23 @@ fn image_format(device: &Device, fourcc: u32) -> Option<VAImageFormat> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A 1080p frame is refined from a twenty-fifth of a bit a pixel on: 60 fps at 5 Mbit/s,
+    /// 8 fps at 0.7, not 60 fps at 2 Mbit/s or 8 fps at 0.5.
+    #[test]
+    fn radeonsi_refines_from_a_twenty_fifth_of_a_bit_a_pixel() {
+        assert!(refines(5_000_000, 60.0, 1920, 1080));
+        assert!(refines(700_000, 8.0, 1920, 1080));
+        assert!(!refines(2_000_000, 60.0, 1920, 1080));
+        assert!(!refines(500_000, 8.0, 1920, 1080));
+    }
+
+    /// A held key frame gets a second of the rate, and never less than 1.6 bits a pixel.
+    #[test]
+    fn a_held_key_frame_gets_a_second_of_the_rate_and_enough_for_the_picture() {
+        assert_eq!(held_key_bits(500_000, 1920, 1080), 1.6 * 1920.0 * 1080.0);
+        assert_eq!(held_key_bits(8_000_000, 1920, 1080), 8_000_000.0);
+    }
 
     /// The planar surface is tried first wherever a device both allocates and renders it, the
     /// packed one after it, and the profile ladder names the 4:4:4 profiles only where a

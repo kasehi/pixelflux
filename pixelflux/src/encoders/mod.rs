@@ -1303,6 +1303,19 @@ impl FrameEncoder {
         }
     }
 
+    /// Whether a constant-rate cleanup through the rate control ends on a key frame held at the
+    /// paint-over quantizer after a large change and a longer stillness: where the rate control
+    /// cannot refine a still screen in the frames' budget and the session says nothing of how far
+    /// it got (`VaapiEncoder::ends_cleanup_on_key`). Elsewhere a refresh or the rate control's
+    /// own frames do, and a key frame would only cost more (libvpx's VP9 key frame of 1080p text
+    /// came out at 231 kB and 30.9 dB at its coarsest).
+    pub fn ends_cleanup_on_key(&self) -> bool {
+        match self {
+            FrameEncoder::Vaapi(enc) => enc.ends_cleanup_on_key(),
+            _ => false,
+        }
+    }
+
     /// Where the last frame was taken back and coded again (`cap`): how far its held band then
     /// reached, or 0 for a frame of the rate control's.
     pub fn refit(&self) -> Option<f64> {
