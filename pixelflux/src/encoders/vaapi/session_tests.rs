@@ -1187,6 +1187,43 @@ fn the_video_processor_is_told_the_declared_color() {
     });
 }
 
+/// A still screen's cleanup frame capped at `bytes` (`VaapiEncoder::cap`) is coded at the rate
+/// that spends them in the cleanup's frame time, its buffer the session's in time, with the
+/// picture and no new sequence; the frame after goes back to the session's rate, and the one
+/// after that carries none.
+#[test]
+fn a_capped_cleanup_frame_carries_its_rate_and_the_next_the_sessions() {
+    mock::reset(Driver::generous());
+    let mut enc = session(Codec::H264, true);
+    let rate_control = || {
+        mock::with(|d| {
+            d.last_misc()
+                .into_iter()
+                .find(|m| m.0 == VAEncMiscParameterTypeRateControl)
+                .map(|m| unsafe {
+                    ptr::read_unaligned(m.1.as_ptr() as *const VAEncMiscParameterRateControl)
+                })
+        })
+    };
+    encode(&mut enc, 0, true);
+    let session_rc = rate_control().expect("a key frame carries the rate control");
+    encode(&mut enc, 1, false);
+    assert!(rate_control().is_none());
+    enc.cap(400_000);
+    let out = encode(&mut enc, 2, false);
+    assert_eq!(parse_video_type(out[1]), Some((Codec::H264, FRAME_DELTA)));
+    let cleanup_rc = rate_control().expect("the capped frame carries its rate");
+    assert_eq!(cleanup_rc.bits_per_second, 16_000_000);
+    assert_eq!(cleanup_rc.window_size, session_rc.window_size);
+    encode(&mut enc, 3, false);
+    assert_eq!(
+        rate_control().map(|rc| rc.bits_per_second),
+        Some(session_rc.bits_per_second)
+    );
+    encode(&mut enc, 4, false);
+    assert!(rate_control().is_none());
+}
+
 /// A rate change opens a new sequence: the next frame is a key frame carrying the new rate
 /// control; a quality change in constant-quantizer mode reaches the next frame as it is.
 #[test]

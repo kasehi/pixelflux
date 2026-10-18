@@ -1267,10 +1267,24 @@ impl FrameEncoder {
     /// Take the next frame back where it comes out past `bytes` and code it again within them:
     /// a band held at a quantizer (`hold_quantizer`) in a shorter band, a frame of the rate
     /// control's at the coarsest quantizer, refining nothing. NVENC, which leaves the frame out of
-    /// the predictions as one a client lost, does; elsewhere the frame stands as coded.
+    /// the predictions as one a client lost, does. VA-API codes the frame at the rate that spends
+    /// `bytes` in the cleanup's frame time instead (`follows_cap`); elsewhere the frame stands as
+    /// coded.
     pub fn cap(&mut self, bytes: usize) {
-        if let FrameEncoder::Nvenc(enc) = self {
-            enc.cap(bytes);
+        match self {
+            FrameEncoder::Nvenc(enc) => enc.cap(bytes),
+            FrameEncoder::Vaapi(enc) => enc.cap(bytes),
+            _ => {}
+        }
+    }
+
+    /// Whether a still screen's cleanup frame is coded at the rate its cap runs at (`cap`), so
+    /// the cleanup judges it against that rate's budget: VA-API at a constant rate, which takes
+    /// a new target with a picture. NVENC takes a frame back instead.
+    pub fn follows_cap(&self) -> bool {
+        match self {
+            FrameEncoder::Vaapi(enc) => enc.follows_cap(),
+            _ => false,
         }
     }
 

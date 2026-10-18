@@ -948,6 +948,10 @@ pub struct VaapiEncoder {
     frame_cap: bool,
     /// The bytes of the last coded frame, padding aside.
     last_bytes: Option<usize>,
+    /// The rate the next frame is coded at, a cleanup frame's (`cap`), where it differs from the session's.
+    cleanup_bps: Option<u32>,
+    /// The rate the driver was last told, by a sequence or a cleanup frame.
+    sent_bps: u32,
     /// The quality index of the average quantizer the driver reported for it.
     last_quality: Option<u32>,
     /// Whether the next frame is measured, the last measurement (`last_psnr`), and whether
@@ -1260,6 +1264,8 @@ impl VaapiEncoder {
             held: None,
             frame_cap: false,
             last_bytes: None,
+            cleanup_bps: None,
+            sent_bps: 0,
             last_quality: None,
             measure: false,
             last_psnr: None,
@@ -1817,6 +1823,25 @@ impl VaapiEncoder {
         }
     }
 
+    /// Whether a still screen's cleanup frame is coded at the rate its cap runs at (`cap`): at
+    /// a constant rate, where the driver takes a new target with a picture.
+    pub fn follows_cap(&self) -> bool {
+        self.rate.cbr
+    }
+
+    /// Code the next frame, a still screen's cleanup, at the rate that spends `bytes` in
+    /// `pipeline::CLEANUP_FRAME_S`, and its buffer as long as the session's
+    /// (`rate_control_at`); the frame after goes back to the session's rate. The session's own
+    /// rate holds a 1080p page at 60 fps 0.5 Mbit/s to frames of 1 kB, which refine nothing
+    /// (18 dB), where a cleanup at a 2 Mbit/s path's rate reaches 52 dB.
+    pub fn cap(&mut self, bytes: usize) {
+        if self.rate.cbr {
+            let bps =
+                (bytes as f64 * 8.0 / crate::pipeline::CLEANUP_FRAME_S).min(u32::MAX as f64) as u32;
+            self.cleanup_bps = Some(bps.max(self.negotiated.bits_per_second));
+        }
+    }
+
     /// Encode the next frame at the quantizer the quality index `crf` selects, and leave the
     /// session's own quantizer for the frame after: the cleanup of a still screen, at a constant
     /// quantizer. A constant-rate session codes the frame under its rate control: radeonsi drops
@@ -1836,10 +1861,12 @@ impl VaapiEncoder {
     /// session holds, with no filler data up to the target and each frame capped at the buffer
     /// where the driver takes a cap and codes under one (`ConstantRate`), and the frame rate
     /// and quality level of any.
-    fn rate_control(&self, out: &mut Buffers) {
+    fn rate_control_at(&self, out: &mut Buffers, bps: u32) {
         if self.rate.cbr {
-            let bps = self.negotiated.bits_per_second;
-            let vbv = self.rate.vbv();
+            // The session's buffer spans the same time at a cleanup frame's rate.
+            let vbv = (self.rate.vbv() as u64 * bps as u64
+                / self.negotiated.bits_per_second.max(1) as u64)
+                .min(u32::MAX as u64) as u32;
             let mut rc: VAEncMiscParameterRateControl = unsafe { std::mem::zeroed() };
             rc.bits_per_second = bps;
             rc.target_percentage = 100;
@@ -2292,9 +2319,18 @@ impl VaapiEncoder {
             slot_surfaces,
         };
         let mut out = Buffers::new();
+        let bps = self
+            .cleanup_bps
+            .take()
+            .unwrap_or(self.negotiated.bits_per_second);
         if key {
             self.arm.sequence(&self.negotiated, &mut out);
-            self.rate_control(&mut out);
+            self.rate_control_at(&mut out, bps);
+            self.sent_bps = bps;
+        } else if self.rate.cbr && bps != self.sent_bps {
+            // radeonsi's VCE takes a new target with a picture, no new sequence.
+            self.rate_control_at(&mut out, bps);
+            self.sent_bps = bps;
         }
         self.arm.picture(&self.negotiated, &frame, &mut out)?;
         let header_len = if self.omit_headers {

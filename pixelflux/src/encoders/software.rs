@@ -1489,6 +1489,7 @@ pub fn encode_cpu(
                 measures: false,
                 psnr: None,
                 refit: None,
+                follows_cap: false,
             },
         )
     };
@@ -1697,6 +1698,7 @@ pub fn encode_cpu(
             measures: false,
             psnr: None,
             refit: None,
+            follows_cap: false,
         };
         let refresh_crf = crate::pipeline::held_refresh_quality(settings, quality) as i32;
         if cleanup != Cleanup::None {
