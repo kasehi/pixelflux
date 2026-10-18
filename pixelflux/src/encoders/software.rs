@@ -1620,8 +1620,8 @@ pub fn encode_cpu(
 
     // A still screen reaches every stripe's cleanup on the same frame; spread them over
     // `CLEANUP_STAGGER_FRAMES` frames so no one frame carries the whole screen's. Under a constant
-    // rate the stripes refining share one budget, so no more refine at once than it feeds at
-    // `REFINE_STRIPE_KBPS` a stripe; the rest wait their turn.
+    // rate x264's stripes refining share one budget, so no more refine at once than it feeds at
+    // `REFINE_STRIPE_KBPS` a stripe; the rest wait their turn (`refine_slots`).
     let per_frame = stripes.len().div_ceil(CLEANUP_STAGGER_FRAMES).max(1);
     let refine_slots = if converges {
         refine_slots(settings, stripes.len())
@@ -2173,10 +2173,16 @@ fn cleanup_vbv_kbit(settings: &RustCaptureSettings, bitrate_kbps: i32) -> i32 {
     frames.max(seconds).max(1) as i32
 }
 
-/// How many stripes refine a still screen through x264's rate control at once: as many as the
-/// session's rate gives `REFINE_STRIPE_KBPS` each, one at least.
+/// How many stripes refine a still screen through their rate control at once: x264's, as many as
+/// the session's rate gives `REFINE_STRIPE_KBPS` each, one at least; OpenH264's, all of them,
+/// since held to that count a GPL-off build left the page at 25 and 19 dB at 8 and 60 fps
+/// 0.5 Mbit/s, against 42 with every stripe refining.
 fn refine_slots(settings: &RustCaptureSettings, n_stripes: usize) -> usize {
-    ((settings.video_bitrate_kbps / REFINE_STRIPE_KBPS).max(1) as usize).min(n_stripes.max(1))
+    let all = n_stripes.max(1);
+    if !cfg!(feature = "gpl") {
+        return all;
+    }
+    ((settings.video_bitrate_kbps / REFINE_STRIPE_KBPS).max(1) as usize).min(all)
 }
 
 /// Split the configured rate budget across the stripes carrying it, returning the
@@ -2323,9 +2329,9 @@ mod tests {
         }
     }
 
-    /// Stripes clean up through the rate control as many at a time as the session's rate gives
-    /// `REFINE_STRIPE_KBPS` each, one at least and never more than there are: two of eight at
-    /// 0.5 Mbit/s, all eight from 2 Mbit/s.
+    /// x264's stripes clean up through the rate control as many at a time as the session's rate
+    /// gives `REFINE_STRIPE_KBPS` each, one at least and never more than there are: two of eight
+    /// at 0.5 Mbit/s, all eight from 2 Mbit/s. OpenH264's all clean up at once.
     #[test]
     fn stripes_refine_as_many_at_once_as_the_rate_feeds() {
         use crate::RustCaptureSettings;
@@ -2339,9 +2345,14 @@ mod tests {
                 8,
             )
         };
-        assert_eq!(slots(100), 1);
-        assert_eq!(slots(500), 2);
-        assert_eq!(slots(1000), 4);
+        if cfg!(feature = "gpl") {
+            assert_eq!(slots(100), 1);
+            assert_eq!(slots(500), 2);
+            assert_eq!(slots(1000), 4);
+        } else {
+            assert_eq!(slots(100), 8);
+            assert_eq!(slots(500), 8);
+        }
         assert_eq!(slots(2000), 8);
         assert_eq!(slots(20000), 8);
     }
