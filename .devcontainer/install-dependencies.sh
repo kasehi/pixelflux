@@ -26,8 +26,13 @@ sudo apt-get install -y \
 sudo apt install -y software-properties-common && sudo add-apt-repository ppa:mozillateam/ppa -y && sudo apt install -y firefox-esr
 
 # Rust toolchain (the extension is built via setuptools-rust / cargo).
+# rustup's installer, checked against the SHA-256 published beside it.
 if ! command -v cargo >/dev/null 2>&1; then
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+  url="https://static.rust-lang.org/rustup/dist/$(uname -m)-unknown-linux-gnu/rustup-init"
+  curl --proto '=https' --tlsv1.2 -sSf -o /tmp/rustup-init "${url}"
+  sum="$(curl --proto '=https' --tlsv1.2 -sSf "${url}.sha256")"
+  echo "${sum%% *}  /tmp/rustup-init" | sha256sum -c -
+  chmod +x /tmp/rustup-init && /tmp/rustup-init -y && rm -f /tmp/rustup-init
   # shellcheck source=/dev/null
   source "$HOME/.cargo/env"
 fi
