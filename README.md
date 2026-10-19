@@ -1,6 +1,6 @@
 # pixelflux
 
-[![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](https://opensource.org/licenses/MPL-2.0) [![Docs](https://img.shields.io/badge/docs-GitHub%20Pages-blue)](https://selkies-project.github.io/pixelflux/) [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/selkies-project/pixelflux)
+[![Tests](https://github.com/selkies-project/pixelflux/actions/workflows/tests.yml/badge.svg)](https://github.com/selkies-project/pixelflux/actions/workflows/tests.yml) [![Release](https://img.shields.io/github/v/release/selkies-project/pixelflux?display_name=tag)](https://github.com/selkies-project/pixelflux/releases/latest) [![PyPI](https://img.shields.io/pypi/v/pixelflux)](https://pypi.org/project/pixelflux/) [![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](https://opensource.org/licenses/MPL-2.0) [![Docs](https://img.shields.io/badge/docs-pixelflux.selkies.io-blue)](https://pixelflux.selkies.io/) [![Discord](https://img.shields.io/badge/dynamic/json?logo=discord&label=Discord%20Members&query=approximate_member_count&url=https%3A%2F%2Fdiscordapp.com%2Fapi%2Finvites%2FwDNGDeSW5F%3Fwith_counts%3Dtrue)](https://discord.gg/wDNGDeSW5F) [![Ask DeepWiki](https://img.shields.io/badge/Ask-DeepWiki-blue)](https://deepwiki.com/selkies-project/pixelflux)
 
 **A performant pixel delivery pipeline for diverse sources, blending flexible and high-performance modern encoding formats.**
 
