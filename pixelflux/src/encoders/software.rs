@@ -1590,16 +1590,11 @@ pub fn encode_cpu(
     let (video_bitrate, video_vbv) = stripe_rate_control(settings, *carrying, n_processing_stripes);
     #[cfg(feature = "gpl")]
     let cleanup_vbv = cleanup_vbv_kbit(settings, video_bitrate).max(video_vbv);
-    // Full-frame x264 threads: one fewer than the cores (headroom for the
-    // capture thread), clamped to [1, 4] to match the four-slice ceiling below.
-    // A full-frame OpenH264 instance applies the same policy internally.
+    // A full-frame x264 stripe runs the H.264 thread policy (`h264_fullframe_threads`), as a
+    // full-frame OpenH264 instance does internally; one stripe of several runs one thread.
     #[cfg(feature = "gpl")]
     let h264_threads = if n_processing_stripes == 1 {
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .saturating_sub(1)
-            .clamp(1, 4) as i32
+        crate::encoders::session::h264_fullframe_threads(settings)
     } else {
         1
     };

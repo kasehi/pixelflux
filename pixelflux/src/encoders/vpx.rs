@@ -156,7 +156,7 @@ impl VpxEncoder {
         let _ = rgba;
         let fullcolor = codec == Codec::Vp9 && settings.video_fullcolor && encodes_444();
         let ten_bit = codec == Codec::Vp9 && settings.video_bit_depth >= 10 && encodes_ten_bit();
-        let threads = encode_threads() as u32;
+        let threads = encode_threads(settings) as u32;
         let rate = RateSettings::new(settings);
         let quality = Quality::new(codec.quantizer(settings.video_crf));
         let iface = unsafe {

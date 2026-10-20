@@ -350,6 +350,9 @@ pub struct RustCaptureSettings {
     pub watermark_location_enum: i32,
     pub encode_node_index: i32,
     pub use_cpu: bool,
+    /// Whether a full-frame software session threads within a frame (`session::encode_threads`);
+    /// off, every software encoder codes and converts on one thread.
+    pub cpu_encode_threading: bool,
     pub debug_logging: bool,
     pub auto_adjust_screen_capture_size: bool,
     pub recording_socket: String,
@@ -475,6 +478,7 @@ impl Default for RustCaptureSettings {
             watermark_location_enum: 0,
             encode_node_index: -2,
             use_cpu: false,
+            cpu_encode_threading: true,
             debug_logging: false,
             auto_adjust_screen_capture_size: false,
             recording_socket: String::new(),
@@ -618,6 +622,11 @@ pub(crate) fn extract_settings(settings: &Bound<'_, PyAny>) -> PyResult<RustCapt
         watermark_location_enum: settings.getattr("watermark_location_enum")?.extract()?,
         encode_node_index: settings.getattr("encode_node_index")?.extract()?,
         use_cpu: settings.getattr("use_cpu")?.extract()?,
+        cpu_encode_threading: settings
+            .getattr("cpu_encode_threading")
+            .ok()
+            .and_then(|v| v.extract::<bool>().ok())
+            .unwrap_or(true),
         debug_logging: {
             let on: bool = settings.getattr("debug_logging")?.extract()?;
             crate::log::set_debug(on);
@@ -7658,6 +7667,11 @@ struct CaptureSettings {
     encode_node_index: i32,
     #[pyo3(get, set)]
     use_cpu: bool,
+    /// Software encoders thread within a frame: x264's and OpenH264's slices, x265's and
+    /// kvazaar's wavefront, libvpx's partitions and rows, SVT-AV1's processors, and the color
+    /// conversion ahead of each. Off, every software session runs on one thread.
+    #[pyo3(get, set)]
+    cpu_encode_threading: bool,
     #[pyo3(get, set)]
     debug_logging: bool,
     #[pyo3(get, set)]
@@ -7748,6 +7762,7 @@ impl CaptureSettings {
             watermark_location_enum: 0,
             encode_node_index: -2,
             use_cpu: false,
+            cpu_encode_threading: true,
             debug_logging: false,
             video_cbr_mode: false,
             video_bitrate_kbps: 4000,

@@ -122,7 +122,7 @@ impl Openh264Encoder {
     /// `width` x `height` is the stripe's geometry, `crf` its constant quantizer, and `bitrate_kbps`
     /// its own CBR budget — the per-stripe share `stripe_rate_control` hands out, since every stripe
     /// runs its own rate control. `fullframe` selects the parallelism policy: a lone full-frame
-    /// stripe encodes with `fullframe_threads` threads over four fixed slices (client decoders
+    /// stripe encodes with `h264_fullframe_threads` threads over four fixed slices (client decoders
     /// slice-parallelize too) and converts color in four bands, so a whole frame never serializes
     /// on one core; one stripe of several is single-threaded and single-slice with a one-band
     /// conversion, its parallelism coming from the stripes encoding concurrently.
@@ -177,7 +177,7 @@ impl Openh264Encoder {
         let fps = Self::clamp_fps(settings.target_fps);
         let crf = crf.clamp(1, 51);
         let (threads, slices) = if fullframe {
-            (Self::fullframe_threads(), 4)
+            (super::session::h264_fullframe_threads(settings) as u16, 4)
         } else {
             (1, 1)
         };
@@ -207,16 +207,6 @@ impl Openh264Encoder {
         };
         me.enable_slices();
         Some(me)
-    }
-
-    /// Encode threads for a lone full-frame instance: one fewer than the available
-    /// parallelism — leaving headroom for capture and the rest of the pipeline — clamped to
-    /// `[1, 4]`, since the frame is split into four slices and more encode threads than slices
-    /// would buy nothing. The x264 full-frame stripe follows the same policy.
-    pub fn fullframe_threads() -> u16 {
-        std::thread::available_parallelism()
-            .map(|n| n.get().saturating_sub(1).clamp(1, 4))
-            .unwrap_or(1) as u16
     }
 
     /// Encoded width in pixels (the request floored to even).

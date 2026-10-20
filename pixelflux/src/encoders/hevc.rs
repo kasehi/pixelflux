@@ -76,7 +76,7 @@ impl HevcEncoder {
         } else {
             8
         };
-        let threads = encode_threads();
+        let threads = encode_threads(settings);
         let rate = RateSettings::new(settings);
         let quality = Quality::new(Codec::H265.quantizer(settings.video_crf));
         let width = settings.width.max(1) as usize;

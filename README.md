@@ -242,6 +242,12 @@ settings.codec = "h264"
 # is the build's (pixelflux.SOFTWARE_ENCODERS): x264 or OpenH264 for H.264, x265 or kvazaar
 # for H.265, libvpx for VP8/VP9, SVT-AV1 for AV1.
 settings.use_cpu = False
+# Software encoders thread within a frame (x264's and OpenH264's slices, x265's and kvazaar's
+# wavefront, libvpx's partitions and rows, SVT-AV1's processors, and the color conversion
+# ahead of each), on one less than the host's cores, up to four for H.264 and eight otherwise.
+# False runs every software session on one thread, to bound what one capture takes of a host
+# that runs many.
+settings.cpu_encode_threading = True
 
 # --- Debugging ---
 settings.debug_logging = False # Enable/disable the continuous FPS and settings log. SVT-AV1's banner follows SVT_LOG, errors-only unless set.

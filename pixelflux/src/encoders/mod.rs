@@ -1578,6 +1578,15 @@ pub enum FrameSource {
     Host { rgba: bool },
 }
 
+/// How many threads a software session encodes on, for its `Encoder:` line.
+fn threads_desc(threads: i32) -> String {
+    if threads == 1 {
+        "1 thread".to_string()
+    } else {
+        format!("{threads} threads")
+    }
+}
+
 /// Choose and build the full-frame encoder of a session, or `None` when the striped software
 /// path serves it. One ladder for X11, Wayland zero-copy, and Wayland readback, so the three
 /// cannot pick differently for the same settings:
@@ -1898,11 +1907,16 @@ fn software_fallback(
     let codec = settings.codec;
     if codec == Codec::H264 {
         println!(
-            "[{tag}] Encoder: software {} ({}) {} {}-bit.",
+            "[{tag}] Encoder: software {} ({}) {} {}-bit, {}.",
             codec.display(),
             software_library(Codec::H264),
             chroma_name(session_fullcolor(None, settings)),
-            session_bit_depth(None, settings)
+            session_bit_depth(None, settings),
+            threads_desc(if settings.video_fullframe {
+                session::h264_fullframe_threads(settings)
+            } else {
+                1
+            })
         );
         return None;
     }
@@ -1917,11 +1931,12 @@ fn software_fallback(
     match session {
         Ok(enc) => {
             println!(
-                "[{tag}] Encoder: software {} ({}) {} {}-bit.",
+                "[{tag}] Encoder: software {} ({}) {} {}-bit, {}.",
                 codec.display(),
                 enc.backend_name(),
                 chroma_name(enc.is_fullcolor()),
-                enc.bit_depth()
+                enc.bit_depth(),
+                threads_desc(session::encode_threads(settings))
             );
             Some(enc)
         }

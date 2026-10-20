@@ -151,7 +151,7 @@ impl SvtAv1Encoder {
                     8
                 },
             ),
-            threads: encode_threads(),
+            threads: encode_threads(settings),
             quality: Quality::new(Codec::Av1.quantizer(settings.video_crf)),
             rate: RateSettings::new(settings),
             omit_headers: settings.omit_stripe_headers,

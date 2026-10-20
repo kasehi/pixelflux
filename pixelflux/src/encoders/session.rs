@@ -320,19 +320,61 @@ impl Pending {
     }
 }
 
-/// The encode threads a software session spreads across: one less than the host's cores,
-/// between one and eight.
-pub fn encode_threads() -> i32 {
+/// The encode threads a software session spreads across, between one and `most`: one less than
+/// the host's cores, or one alone where `cpu_encode_threading` is off. The conversion ahead of
+/// the encoder runs on as many.
+fn threads_up_to(settings: &RustCaptureSettings, most: usize) -> i32 {
+    if !settings.cpu_encode_threading {
+        return 1;
+    }
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
         .saturating_sub(1)
-        .clamp(1, 8) as i32
+        .clamp(1, most) as i32
+}
+
+/// The encode threads a full-frame H.265, VP8, VP9, or AV1 software session spreads across
+/// (`threads_up_to` eight): x265's and kvazaar's wavefront, libvpx's token partitions and
+/// rows, and SVT-AV1's logical processors.
+pub fn encode_threads(settings: &RustCaptureSettings) -> i32 {
+    threads_up_to(settings, 8)
+}
+
+/// The encode threads a full-frame H.264 software session spreads across (`threads_up_to`
+/// four): x264's sliced threads, and OpenH264's threads over its four slices, more than which
+/// would buy nothing.
+pub fn h264_fullframe_threads(settings: &RustCaptureSettings) -> i32 {
+    threads_up_to(settings, 4)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every software session's thread count follows `cpu_encode_threading`: one thread with it
+    /// off, and with it on one less than the cores within the session's ceiling, one at least.
+    #[test]
+    fn cpu_encode_threading_off_leaves_every_session_one_thread() {
+        let off = RustCaptureSettings {
+            cpu_encode_threading: false,
+            ..Default::default()
+        };
+        assert_eq!(encode_threads(&off), 1);
+        assert_eq!(h264_fullframe_threads(&off), 1);
+        let on = RustCaptureSettings::default();
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        assert_eq!(
+            encode_threads(&on),
+            cores.saturating_sub(1).clamp(1, 8) as i32
+        );
+        assert_eq!(
+            h264_fullframe_threads(&on),
+            cores.saturating_sub(1).clamp(1, 4) as i32
+        );
+    }
 
     #[test]
     fn a_quality_increase_applies_at_once_and_a_drop_waits() {
