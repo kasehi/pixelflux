@@ -68,8 +68,9 @@ const BITRATE_CEILING_BPS: u32 = 100_000_000;
 /// (`y_buf` / `u_buf` / `v_buf`) that each frame's RGB-to-YUV conversion writes into before
 /// hand-off. `threads`, `slices`, and `csc_bands` are the parallelism policy fixed at open: a lone
 /// full-frame instance encodes with several threads over four slices and converts color in four
-/// bands, while a stripe of the striped path is single-threaded and single-slice, its parallelism
-/// coming from the stripes encoding concurrently. `is_cbr` selects the rate-control mode: `true` is
+/// bands (one thread and one band without `cpu_encode_threading`, the four slices kept), while a
+/// stripe of the striped path is single-threaded and single-slice, its parallelism coming from the
+/// stripes encoding concurrently. `is_cbr` selects the rate-control mode: `true` is
 /// CBR (bitrate-mode RC driving a target bitrate), `false` is CRF/CQP (the same bitrate-mode RC but
 /// with the QP pinned to a single value). `omit_stripe_headers` drops the wire header for
 /// bare Annex-B output.
@@ -124,8 +125,9 @@ impl Openh264Encoder {
     /// runs its own rate control. `fullframe` selects the parallelism policy: a lone full-frame
     /// stripe encodes with `h264_fullframe_threads` threads over four fixed slices (client decoders
     /// slice-parallelize too) and converts color in four bands, so a whole frame never serializes
-    /// on one core; one stripe of several is single-threaded and single-slice with a one-band
-    /// conversion, its parallelism coming from the stripes encoding concurrently.
+    /// on one core, unless `cpu_encode_threading` is off, which leaves it one thread and one band;
+    /// one stripe of several is single-threaded and single-slice with a one-band conversion, its
+    /// parallelism coming from the stripes encoding concurrently.
     ///
     /// 1. **Geometry**: width and height are floored to even values (`& !1`, min 2) because 4:2:0
     ///    chroma subsampling requires it. A 4:4:4 request is encoded 4:2:0 regardless: OpenH264 is
@@ -192,7 +194,8 @@ impl Openh264Encoder {
             height,
             threads,
             slices,
-            csc_bands: slices as usize,
+            // The conversion takes a band a thread; one alone converts in one.
+            csc_bands: if threads > 1 { slices as usize } else { 1 },
             y_buf: vec![0u8; width * height],
             u_buf: vec![0u8; cw * ch],
             v_buf: vec![0u8; cw * ch],
@@ -848,6 +851,30 @@ mod tests {
     }
 
     /// The stream declares the matrix its input was converted with: BT.709 at limited range.
+    /// A full-frame session encodes on the H.264 thread policy over four slices, converting in a
+    /// band a thread; without `cpu_encode_threading` on one thread and in one band, the four
+    /// slices kept for the client's decoder.
+    #[test]
+    fn cpu_encode_threading_off_converts_in_one_band() {
+        let off = RustCaptureSettings {
+            width: 320,
+            height: 192,
+            target_fps: 30.0,
+            cpu_encode_threading: false,
+            ..Default::default()
+        };
+        let enc = Openh264Encoder::new(&off).expect("openh264 init");
+        assert_eq!((enc.threads, enc.slices, enc.csc_bands), (1, 4, 1));
+        let on = RustCaptureSettings {
+            cpu_encode_threading: true,
+            ..off
+        };
+        let threads = super::super::session::h264_fullframe_threads(&on) as u16;
+        let enc = Openh264Encoder::new(&on).expect("openh264 init");
+        assert_eq!((enc.threads, enc.slices), (threads, 4));
+        assert_eq!(enc.csc_bands, if threads > 1 { 4 } else { 1 });
+    }
+
     #[test]
     fn declares_the_conversion_matrix() {
         use crate::webcam::decode::{ColorTags, Decoder, VideoDecoder};

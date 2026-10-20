@@ -1421,7 +1421,9 @@ pub fn stripes_held_still(stripes: &[StripeState], settings: &RustCaptureSetting
 ///    and more than four slices trips decode glitches in some Chromium builds, and the minus-one
 ///    leaves headroom for the capture thread. Multiple stripes instead run across the rayon pool
 ///    with a single encode thread and one conversion band each, since the parallelism there
-///    already comes from encoding the stripes concurrently.
+///    already comes from encoding the stripes concurrently. Without `cpu_encode_threading` the
+///    full frame takes one thread and the stripes are coded one after another
+///    (`stripes_at_once`).
 #[allow(clippy::too_many_arguments)]
 pub fn encode_cpu(
     stripes: &mut Vec<StripeState>,
@@ -2055,7 +2057,7 @@ pub fn encode_cpu(
             None
         }
     };
-    let encoded: Vec<EncodedStripe> = if n_processing_stripes <= 1 {
+    let encoded: Vec<EncodedStripe> = if !stripes_at_once(settings, n_processing_stripes) {
         stripes
             .iter_mut()
             .enumerate()
@@ -2078,6 +2080,12 @@ pub fn encode_cpu(
     };
     *carrying += (sent - *carrying) * alpha;
     encoded
+}
+
+/// Whether a frame's `n` stripes are coded at once across the rayon pool, or one after another on
+/// the encode thread: one stripe, or a session without `cpu_encode_threading`, takes no other.
+fn stripes_at_once(settings: &RustCaptureSettings, n: usize) -> bool {
+    n > 1 && settings.cpu_encode_threading
 }
 
 /// How many horizontal stripes a frame of `height` is split into, which is the choice of how
@@ -2289,6 +2297,22 @@ mod stripe_count_tests {
 
 #[cfg(test)]
 mod tests {
+    /// Stripes are coded at once only where there are several and `cpu_encode_threading` is on.
+    #[test]
+    fn stripes_are_coded_at_once_only_with_cpu_encode_threading() {
+        use super::stripes_at_once;
+        use crate::RustCaptureSettings;
+        let on = RustCaptureSettings::default();
+        let off = RustCaptureSettings {
+            cpu_encode_threading: false,
+            ..Default::default()
+        };
+        assert!(stripes_at_once(&on, 8));
+        assert!(!stripes_at_once(&on, 1));
+        assert!(!stripes_at_once(&off, 8));
+        assert!(!stripes_at_once(&off, 1));
+    }
+
     /// The configured bitrate is a budget for the screen, not for each stripe: every stripe
     /// runs its own rate control, so what reaches an encoder is the budget over the number of
     /// stripes carrying motion. Dividing by the stripe count instead spends a fraction of the

@@ -225,8 +225,8 @@ ultrafast, VP8 speed 16, VP9 speed 8 with screen tuning, SVT-AV1 preset 11 in it
 predicting from an anchor alone at preset 10, since preset 11 leaves some blocks the picture changed since the anchor
 as they stood in it (`ANCHOR_PRESET`), x265 ultrafast with wavefront threads; each full-frame software session, and the conversion ahead of it, on the
 threads `encoders::session::encode_threads` names, one less than the cores up to eight, four for H.264's slices,
-or one alone where `cpu_encode_threading` is off; the striped encoders keep their stripes in parallel, OpenH264 its
-four-band conversion, and a Turbo frame its hash beside the encode either way), NVENC at preset P3 with two-pass quarter-resolution rate control
+or one alone where `cpu_encode_threading` is off, which also codes the striped encoders' stripes one after another;
+a Turbo frame keeps its hash beside the encode either way), NVENC at preset P3 with two-pass quarter-resolution rate control
 (`gpu_bench_tuning` measures the alternatives), and VA-API at the fastest quality level the driver takes, on the low-power entry point where the driver lists one, except H.264 on Skylake and Broxton, whose low-power encoder codes a picture as one slice whatever it is handed and reports nothing of it (told by the kernel's PCI id; the full entry point first, the low-power one in a single slice where the driver build carries no other); the VP8, VP9, and AV1 quantizer tables in `codec.rs`,
 and the hardware ones, were measured at those settings and must be re-measured whenever they change
 (`encoders::codec` documents the method; `cleanup_bench` with `PF_BENCH_SSIM=1` measures it). VP9 carries 4:4:4 as profile 1 (libvpx 1.13 on) at the same limited range as its 4:2:0, so the decoder hint the

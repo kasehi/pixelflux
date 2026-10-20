@@ -242,13 +242,13 @@ settings.codec = "h264"
 # is the build's (pixelflux.SOFTWARE_ENCODERS): x264 or OpenH264 for H.264, x265 or kvazaar
 # for H.265, libvpx for VP8/VP9, SVT-AV1 for AV1.
 settings.use_cpu = False
-# Full-frame software encoders thread within a frame (x264's and OpenH264's slices, x265's and
+# Software encoders thread within a frame (x264's and OpenH264's slices, x265's and
 # kvazaar's wavefront, libvpx's partitions and rows, SVT-AV1's processors, and the color
 # conversion ahead of each), on one less than the host's cores, up to four for H.264 and eight
-# otherwise. False codes each of them on one thread, to bound what one capture takes of a host
-# that runs many. The striped encoders (H.264 without video_fullframe, JPEG) keep coding their
-# stripes in parallel, OpenH264 keeps its four-band conversion, and a Turbo session still hashes
-# its frame on a thread beside the encode.
+# otherwise; the striped encoders (H.264 without video_fullframe, JPEG) code their stripes in
+# parallel. False codes each frame on one thread, the stripes one after another, to bound what one
+# capture takes of a host that runs many; a Turbo session still hashes its frame on a thread
+# beside the encode.
 settings.cpu_encode_threading = True
 
 # --- Debugging ---

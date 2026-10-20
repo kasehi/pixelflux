@@ -1578,9 +1578,12 @@ pub enum FrameSource {
     Host { rgba: bool },
 }
 
-/// The threads a striped H.264 session encodes on: its stripes at once, one a rayon worker,
-/// whatever `cpu_encode_threading` says.
+/// The threads a striped H.264 session encodes on: its stripes at once, one a rayon worker, or
+/// one after another where `cpu_encode_threading` is off.
 fn striped_threads(settings: &RustCaptureSettings) -> i32 {
+    if !settings.cpu_encode_threading {
+        return 1;
+    }
     software::stripe_count(settings.height, settings.codec, false).min(rayon::current_num_threads())
         as i32
 }
