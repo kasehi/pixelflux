@@ -351,7 +351,8 @@ pub struct RustCaptureSettings {
     pub encode_node_index: i32,
     pub use_cpu: bool,
     /// Whether a full-frame software session threads within a frame (`session::encode_threads`);
-    /// off, every software encoder codes and converts on one thread.
+    /// off, each full-frame software encoder codes on one thread. The striped encoders keep
+    /// their stripes in parallel either way.
     pub cpu_encode_threading: bool,
     pub debug_logging: bool,
     pub auto_adjust_screen_capture_size: bool,
@@ -7667,9 +7668,10 @@ struct CaptureSettings {
     encode_node_index: i32,
     #[pyo3(get, set)]
     use_cpu: bool,
-    /// Software encoders thread within a frame: x264's and OpenH264's slices, x265's and
-    /// kvazaar's wavefront, libvpx's partitions and rows, SVT-AV1's processors, and the color
-    /// conversion ahead of each. Off, every software session runs on one thread.
+    /// Full-frame software encoders thread within a frame: x264's and OpenH264's slices, x265's
+    /// and kvazaar's wavefront, libvpx's partitions and rows, SVT-AV1's processors, and the
+    /// color conversion ahead of each. Off, each codes on one thread; the striped encoders
+    /// (H.264 without `video_fullframe`, JPEG) keep their stripes in parallel.
     #[pyo3(get, set)]
     cpu_encode_threading: bool,
     #[pyo3(get, set)]
