@@ -1978,16 +1978,26 @@ fn a_session_cuts_no_more_slices_than_the_driver_takes() {
 }
 
 /// An H.264 picture is coded no finer than the floor radeonsi's VCN 1 codes sharp edges at, at a
-/// constant quantizer and as the bound of a constant rate; HEVC keeps the quantizer asked.
+/// constant quantizer and as the bound of a constant rate; an HEVC picture no finer than Intel's
+/// low-power encoder codes, which leaves a slice naming a finer quantizer coded at its floor,
+/// and keeps the quantizer asked, read off the driver's curve, on any other entry point or
+/// driver.
 #[test]
-fn an_h264_picture_is_coded_no_finer_than_the_floor() {
-    for (codec, cbr, wanted) in [
-        (Codec::H264, false, 7),
-        (Codec::H264, true, 7),
-        (Codec::H265, false, 5),
+fn a_picture_is_coded_no_finer_than_the_floor() {
+    let intel = Some(c"Intel iHD driver for Intel(R) Gen Graphics - 25.2.3 ()");
+    for (codec, cbr, vendor, entrypoint, wanted) in [
+        (Codec::H264, false, None, VAEntrypointEncSliceLP, 7),
+        (Codec::H264, true, None, VAEntrypointEncSliceLP, 7),
+        (Codec::H265, false, None, VAEntrypointEncSliceLP, 5),
+        (Codec::H265, false, intel, VAEntrypointEncSliceLP, 10),
+        (Codec::H265, false, intel, VAEntrypointEncSlice, 4),
     ] {
-        mock::reset(Driver::generous());
+        let mut driver = Driver::generous();
+        driver.vendor = vendor;
+        driver.entrypoints = vec![entrypoint];
+        mock::reset(driver);
         let mut enc = session(codec, cbr);
+        assert_eq!(enc.low_power(), entrypoint == VAEntrypointEncSliceLP);
         enc.encode_host(&frame(), (W * 4) as usize, false, 0, 5, true)
             .unwrap();
         mock::with(|d| {

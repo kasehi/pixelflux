@@ -26,6 +26,11 @@ const LOG2_MAX_POC_LSB_MINUS4: u32 = 8;
 /// delta.
 const PIC_INIT_QP_CBR: u32 = 30;
 const PIC_INIT_QP_CQP: u32 = 26;
+/// The finest quantizer Intel's low-power HEVC encoder codes (the driver's
+/// `CODEC_HEVC_MIN_QP_LP`): a slice naming a finer one is coded at this one regardless, so the
+/// decoder dequantizes it too fine and the picture comes out washed out, the more so the finer
+/// the slice names (31 dB at 9 and 16 dB at 2 against 59 dB at 10, Arc A750).
+pub(super) const INTEL_LOW_POWER_MIN_QP: u32 = 10;
 
 /// The coding tools and block sizes a session runs with: what the driver reports, or the
 /// defaults of `Arm::new` where it reports none.
@@ -475,7 +480,7 @@ impl Arm {
         out.push(VAEncPictureParameterBufferType, &pic);
 
         let slice_qp = if n.rc_mode == VA_RC_CQP {
-            frame.qp.clamp(1, 51)
+            frame.qp.clamp(n.qp_floor.max(1), 51)
         } else {
             self.pic_init_qp
         };

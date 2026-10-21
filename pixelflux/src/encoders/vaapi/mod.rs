@@ -827,6 +827,9 @@ pub(super) struct Negotiated {
     /// The quantizer bounds of a constant-rate session in the codec's own domain, 0 for none.
     pub min_qp: u32,
     pub max_qp: u32,
+    /// The finest quantizer the entry point codes a constant-quantizer picture at
+    /// (`h265::INTEL_LOW_POWER_MIN_QP` on Intel's low-power HEVC encoder, 1 elsewhere).
+    pub qp_floor: u32,
 }
 
 /// One frame as the codec arms see it: what it is, where its reconstruction and coded output
@@ -1276,6 +1279,14 @@ impl VaapiEncoder {
                 bit_depth,
                 min_qp: codec.hardware_quantizer_bound(device.hardware(), rate.min_qp),
                 max_qp: codec.hardware_quantizer_bound(device.hardware(), rate.max_qp),
+                qp_floor: if codec == Codec::H265
+                    && device.hardware() == Hardware::VaapiIntel
+                    && entrypoint == VAEntrypointEncSliceLP
+                {
+                    h265::INTEL_LOW_POWER_MIN_QP
+                } else {
+                    1
+                },
             },
             fourcc,
             rt_format,

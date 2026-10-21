@@ -229,7 +229,11 @@ or one alone where `cpu_encode_threading` is off, which also codes the striped e
 a Turbo frame keeps its hash beside the encode either way), NVENC at preset P3 with two-pass quarter-resolution rate control
 (`gpu_bench_tuning` measures the alternatives), and VA-API at the fastest quality level the driver takes, on the low-power entry point where the driver lists one, except H.264 on Skylake and Broxton, whose low-power encoder codes a picture as one slice whatever it is handed and reports nothing of it (told by the kernel's PCI id; the full entry point first, the low-power one in a single slice where the driver build carries no other); the VP8, VP9, and AV1 quantizer tables in `codec.rs`,
 and the hardware ones, were measured at those settings and must be re-measured whenever they change
-(`encoders::codec` documents the method; `cleanup_bench` with `PF_BENCH_SSIM=1` measures it). VP9 carries 4:4:4 as profile 1 (libvpx 1.13 on) at the same limited range as its 4:2:0, so the decoder hint the
+(`encoders::codec` documents the method; `cleanup_bench` with `PF_BENCH_SSIM=1` measures it). Intel's low-power
+HEVC encoder codes no quantizer under 10 and codes a slice naming a finer one at 10 regardless, which decodes washed
+out, so a constant-quantizer session there is floored at 10 (`vaapi::h265::INTEL_LOW_POWER_MIN_QP`); its H.264
+codes such a slice at its own floor, header and all, and its rate control stays at or above it by itself, so neither
+takes the floor. VP9 carries 4:4:4 as profile 1 (libvpx 1.13 on) at the same limited range as its 4:2:0, so the decoder hint the
 client sends for it stays true. The CBR
 sessions of x264 and x265 cap the quantizer at 51: both libraries default to an out-of-spec range above
 it that forces macroblock skips on a VBV underflow, which freezes rows of a screen for a few frames, so a
