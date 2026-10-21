@@ -1666,13 +1666,18 @@ impl X11Pipeline {
     /// # Returns
     ///
     /// `true` if the pipeline was successfully adapted in place; `false` when the active encoder
-    /// cannot follow (VAAPI on resize) and the caller must rebuild.
+    /// cannot follow (VAAPI on resize), or the striped software path stands where an engine
+    /// may take the new size (one that refused the old size, past its maximum), and the caller
+    /// must rebuild.
     pub fn reshape(&mut self, settings: &RustCaptureSettings, size_changed: bool) -> bool {
+        // A demotion (`recover_hw`) holds for the pipeline's life.
+        let demoted = self.settings.use_cpu;
         if !size_changed {
             if let Some(FrameEncoder::Nvenc(enc)) = &mut self.hw {
                 enc.release_pinned_hosts();
             }
             self.settings = settings.clone();
+            self.settings.use_cpu |= demoted;
             return true;
         }
         match &mut self.hw {
@@ -1682,12 +1687,21 @@ impl X11Pipeline {
                     return false;
                 }
             }
-            None => {}
+            None => {
+                if self.settings.codec.is_video()
+                    && self.settings.codec == settings.codec
+                    && !demoted
+                    && encoders::engine_may_serve(settings)
+                {
+                    return false;
+                }
+            }
             _ => return false,
         }
         let codec = self.settings.codec;
         self.settings = settings.clone();
         self.settings.codec = codec;
+        self.settings.use_cpu |= demoted;
         self.stripes.clear();
         self.hw_state = StripeState::default();
         self.turbo_dirty.clear();
@@ -4632,6 +4646,88 @@ mod tests {
             stripes.iter().map(|s| s.data.len() as u64).sum::<u64>()
         );
         assert!(totals.encode_ns >= 1_000_000 && totals.pipeline_ns >= 2_000_000);
+    }
+
+    /// A striped H.264 session where no engine may take the stream reshapes in place on a resize:
+    /// software forced, encoding off the node, and a demotion, which a reshape at the same size
+    /// keeps.
+    #[test]
+    fn x11_software_h264_reshapes_in_place_where_no_engine_may_take_it() {
+        let s = RustCaptureSettings {
+            width: 640,
+            height: 384,
+            codec: Codec::H264,
+            use_cpu: true,
+            ..Default::default()
+        };
+        let resized = RustCaptureSettings {
+            width: 1280,
+            height: 720,
+            ..s.clone()
+        };
+        let mut p = X11Pipeline::new(s.clone());
+        assert!(p.hw.is_none());
+        assert!(p.reshape(&resized, true), "software was asked for");
+
+        let off_node = RustCaptureSettings {
+            use_cpu: false,
+            encode_node_index: -1,
+            ..s.clone()
+        };
+        let mut p = X11Pipeline::new(off_node.clone());
+        assert!(p.reshape(
+            &RustCaptureSettings {
+                width: 1280,
+                height: 720,
+                ..off_node
+            },
+            true
+        ));
+
+        // The demotion `recover_hw` leaves.
+        let mut p = X11Pipeline::new(s.clone());
+        let live = RustCaptureSettings {
+            use_cpu: false,
+            ..s.clone()
+        };
+        assert!(p.reshape(&live, false));
+        assert!(p.settings.use_cpu, "a reshape keeps the demotion");
+        assert!(p.reshape(
+            &RustCaptureSettings {
+                width: 1280,
+                height: 720,
+                ..live
+            },
+            true
+        ));
+    }
+
+    /// A capture larger than the engine's maximum H.264 picture comes up in software, and a
+    /// resize into the engine's range rebuilds it there. Ignored by default; run with the GPU set.
+    #[test]
+    #[ignore]
+    fn gpu_x11_h264_past_the_engine_maximum_takes_the_engine_once_resized() {
+        let big = RustCaptureSettings {
+            width: 8192,
+            height: 4096,
+            ..crate::x11::gpu_test_support::settings(Codec::H264)
+        };
+        let mut p = X11Pipeline::new(big.clone());
+        assert!(
+            p.hw.is_none(),
+            "8192x4096 is past every engine's H.264 maximum"
+        );
+        let resized = RustCaptureSettings {
+            width: 1362,
+            height: 1036,
+            ..big
+        };
+        assert!(
+            !p.reshape(&resized, true),
+            "the engine may take the new size"
+        );
+        let rebuilt = X11Pipeline::new(resized);
+        assert!(rebuilt.hw.as_ref().is_some_and(FrameEncoder::is_hardware));
     }
 
     /// A JPEG stream's log line names the library that encodes it, as its report does.

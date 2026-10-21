@@ -1724,6 +1724,27 @@ pub(crate) fn ten_bit_is_softwares(settings: &RustCaptureSettings) -> bool {
         .is_ok_and(|served| hardware_lacks_ten_bit(&served, settings))
 }
 
+/// Whether an engine may take the codec `settings` names at another size: software is not
+/// forced, and the encode node's probe found an engine for it, at the depth asked, or found every
+/// session taken. A session the ladder left in software where this holds was refused for
+/// something a resize can change (an engine's maximum size), so it runs the ladder again.
+pub(crate) fn engine_may_serve(settings: &RustCaptureSettings) -> bool {
+    if settings.use_cpu || settings.encode_node_index == -1 {
+        return false;
+    }
+    #[cfg(target_arch = "aarch64")]
+    if tegra::available() {
+        return tegra::served().contains(&settings.codec);
+    }
+    match probe_node(settings.encode_node_index) {
+        Ok(served) => {
+            served.iter().any(|&(c, ..)| c == settings.codec)
+                && !hardware_lacks_ten_bit(&served, settings)
+        }
+        Err((_, e)) => e == nvenc::SESSIONS_TAKEN,
+    }
+}
+
 /// The ladder for the one codec `settings` names; `None` where no backend of it opened, and for
 /// H.264 on host frames, whose software path the caller encodes itself.
 fn select_for_codec(
