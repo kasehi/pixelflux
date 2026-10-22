@@ -915,6 +915,9 @@ pub struct AppState {
     pub primary_selection_state: PrimarySelectionState,
     pub popups: PopupManager,
 
+    /// Screenshot readback buffers, ahead of the renderer: dropped first, they forget their
+    /// mappings while its GL context still holds them.
+    pub(crate) screenshot_readbacks: crate::ScreenshotReadbacks,
     pub gles_renderer: Option<GlesRenderer>,
     pub pixman_renderer: Option<PixmanRenderer>,
 

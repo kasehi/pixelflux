@@ -164,21 +164,117 @@ impl Drop for ScreenshotBuffer {
     }
 }
 
+/// A pixel-pack buffer the compositor's GL readback lands in, mapped persistently so the
+/// screenshot's caller copies the pixels out on its own thread. The mapping is valid while
+/// `mapped` is set; the compositor clears it, under the lock a copy holds, before it deletes the
+/// buffer or its GL context goes away.
+pub(crate) struct ReadbackSlot {
+    pub(crate) id: u32,
+    pub(crate) size: usize,
+    ptr: usize,
+    mapped: Mutex<bool>,
+}
+
+impl ReadbackSlot {
+    /// # Safety
+    /// `ptr` must address `size` readable bytes until [`ReadbackSlot::unmap`] returns.
+    pub(crate) unsafe fn new(id: u32, ptr: *const u8, size: usize) -> Self {
+        Self {
+            id,
+            size,
+            ptr: ptr as usize,
+            mapped: Mutex::new(true),
+        }
+    }
+
+    /// Whether a screenshot still holds the slot, which the compositor then neither reuses nor
+    /// deletes.
+    pub(crate) fn in_use(self: &Arc<Self>) -> bool {
+        Arc::strong_count(self) > 1
+    }
+
+    /// Forget the mapping, waiting out a copy under way.
+    pub(crate) fn unmap(&self) {
+        *self.mapped.lock().unwrap() = false;
+    }
+
+    pub(crate) fn copy_out(&self, len: usize) -> Result<ScreenshotBuffer, String> {
+        let mapped = self.mapped.lock().unwrap();
+        if !*mapped {
+            return Err("Screenshot compositor stopped".to_string());
+        }
+        if len > self.size {
+            return Err("Screenshot readback produced incomplete pixels".to_string());
+        }
+        // SAFETY: the mapping stays readable while `mapped` is held set (see `new`).
+        let pixels = unsafe { std::slice::from_raw_parts(self.ptr as *const u8, len) };
+        Ok(ScreenshotBuffer::copy_of(pixels))
+    }
+}
+
+/// A screenshot the GPU is still reading back into a [`ReadbackSlot`].
+pub struct GpuReadback {
+    pub(crate) slot: Arc<ReadbackSlot>,
+    pub(crate) sync: smithay::backend::renderer::sync::SyncPoint,
+    pub(crate) len: usize,
+}
+
+impl GpuReadback {
+    /// Wait for the readback until `deadline`, then copy the pixels out of the slot.
+    fn resolve(self, deadline: Instant) -> Result<ScreenshotBuffer, String> {
+        while !self.sync.is_reached() {
+            if Instant::now() >= deadline {
+                return Err("Screenshot timed out".to_string());
+            }
+            thread::sleep(Duration::from_micros(200));
+        }
+        self.slot.copy_out(self.len)
+    }
+}
+
+/// A screenshot's pixels: in the caller's buffer, or still on their way from the GPU.
+pub enum ScreenshotPixels {
+    Ready(ScreenshotBuffer),
+    Gpu(GpuReadback),
+}
+
+impl From<Vec<u8>> for ScreenshotPixels {
+    fn from(pixels: Vec<u8>) -> Self {
+        Self::Ready(pixels.into())
+    }
+}
+
 /// An owned copy of one rendered output, independent of the streaming buffer pool.
 /// Channel conversion and PNG compression run in the requesting thread.
 pub struct ScreenshotFrame {
-    pub pixels: ScreenshotBuffer,
+    pub pixels: ScreenshotPixels,
     pub width: u32,
     pub height: u32,
     pub format: ScreenshotPixelFormat,
 }
 
 impl ScreenshotFrame {
-    fn encode_png(mut self) -> Result<Vec<u8>, String> {
+    /// The frame with its pixels in the caller's buffer, a GPU readback waited for until
+    /// `deadline` and copied out.
+    fn resolve(self, deadline: Instant) -> Result<Self, String> {
+        let pixels = match self.pixels {
+            ScreenshotPixels::Ready(pixels) => pixels,
+            ScreenshotPixels::Gpu(readback) => readback.resolve(deadline)?,
+        };
+        Ok(Self {
+            pixels: ScreenshotPixels::Ready(pixels),
+            ..self
+        })
+    }
+
+    fn encode_png(self) -> Result<Vec<u8>, String> {
+        let ScreenshotPixels::Ready(mut pixels) = self.pixels else {
+            return Err("Screenshot pixels are still being read back".to_string());
+        };
         let expected = (self.width as usize)
             .checked_mul(self.height as usize)
             .and_then(|n| n.checked_mul(4));
-        if self.width == 0 || self.height == 0 || expected != Some(self.pixels.len()) {
+        if self.width == 0 || self.height == 0 || expected != Some(pixels.len()) {
             return Err("Screenshot render produced an invalid framebuffer".to_string());
         }
         let swap = matches!(
@@ -190,7 +286,7 @@ impl ScreenshotFrame {
             ScreenshotPixelFormat::Rgbx | ScreenshotPixelFormat::Bgrx
         );
         if swap || opaque {
-            for px in self.pixels.as_chunks_mut::<4>().0 {
+            for px in pixels.as_chunks_mut::<4>().0 {
                 if swap {
                     px.swap(0, 2);
                 }
@@ -199,7 +295,7 @@ impl ScreenshotFrame {
                 }
             }
         }
-        encode_png_rgba(&self.pixels, self.width, self.height)
+        encode_png_rgba(&pixels, self.width, self.height)
     }
 }
 
@@ -498,6 +594,7 @@ impl CuBackend for CuWaylandBackend {
                     "Screenshot compositor disconnected".to_string()
                 }
             })??;
+        let frame = frame.resolve(deadline)?;
         if Instant::now() >= deadline {
             return Err("Screenshot timed out".to_string());
         }
@@ -1710,13 +1807,14 @@ mod record_path_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        ScreenshotAdmission, ScreenshotBuffers, ScreenshotFrame, ScreenshotPixelFormat,
-        cu_listeners, encode_png_rgba,
+        GpuReadback, ReadbackSlot, ScreenshotAdmission, ScreenshotBuffers, ScreenshotFrame,
+        ScreenshotPixelFormat, ScreenshotPixels, cu_listeners, encode_png_rgba,
     };
     use std::io::Cursor;
     use std::net::{IpAddr, Ipv4Addr, TcpListener};
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn screenshot_png_preserves_channels_alpha_and_encoding() {
@@ -1796,6 +1894,101 @@ mod tests {
                 decoded.into_raw(),
                 [11, 22, 33, 255, 44, 55, 66, 255, 77, 88, 99, 255]
             );
+        }
+    }
+
+    /// A fence the test signals by hand.
+    #[derive(Debug, Default)]
+    struct TestFence(std::sync::atomic::AtomicBool);
+
+    impl smithay::backend::renderer::sync::Fence for TestFence {
+        fn is_signaled(&self) -> bool {
+            self.0.load(Ordering::Acquire)
+        }
+        fn wait(&self) -> Result<(), smithay::backend::renderer::sync::Interrupted> {
+            Ok(())
+        }
+        fn is_exportable(&self) -> bool {
+            false
+        }
+        fn export(&self) -> Option<std::os::fd::OwnedFd> {
+            None
+        }
+    }
+
+    #[test]
+    fn screenshot_readback_slot_copies_while_mapped_and_refuses_after() {
+        let mapping: Vec<u8> = (0..16).collect();
+        // SAFETY: `mapping` outlives every copy below.
+        let slot = Arc::new(unsafe { ReadbackSlot::new(7, mapping.as_ptr(), mapping.len()) });
+        assert!(!slot.in_use());
+        let held = Arc::clone(&slot);
+        assert!(slot.in_use());
+        assert_eq!(&*held.copy_out(8).unwrap(), &mapping[..8]);
+        assert!(held.copy_out(17).is_err());
+        slot.unmap();
+        assert_eq!(
+            held.copy_out(8).err().unwrap(),
+            "Screenshot compositor stopped"
+        );
+        drop(held);
+        assert!(!slot.in_use());
+    }
+
+    #[test]
+    fn screenshot_gpu_readback_waits_for_its_fence_until_the_deadline() {
+        let mapping = [9u8; 12];
+        // SAFETY: `mapping` outlives the readbacks below.
+        let slot = Arc::new(unsafe { ReadbackSlot::new(1, mapping.as_ptr(), mapping.len()) });
+        let fence = Arc::new(TestFence::default());
+        let pending = |fence: &Arc<TestFence>| GpuReadback {
+            slot: Arc::clone(&slot),
+            sync: smithay::backend::renderer::sync::SyncPoint::from(TestFenceRef(Arc::clone(
+                fence,
+            ))),
+            len: 12,
+        };
+        let late = pending(&fence).resolve(Instant::now() + Duration::from_millis(5));
+        assert_eq!(late.err().unwrap(), "Screenshot timed out");
+        assert!(!slot.in_use(), "a timed-out readback releases its slot");
+        fence.0.store(true, Ordering::Release);
+        let ready = pending(&fence)
+            .resolve(Instant::now() + Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(&*ready, &mapping[..]);
+        let frame = ScreenshotFrame {
+            pixels: ScreenshotPixels::Gpu(pending(&fence)),
+            width: 3,
+            height: 1,
+            format: ScreenshotPixelFormat::Rgba,
+        };
+        assert!(
+            ScreenshotFrame {
+                pixels: ScreenshotPixels::Gpu(pending(&fence)),
+                ..frame.resolve(Instant::now()).unwrap()
+            }
+            .encode_png()
+            .is_err(),
+            "pixels still on their way are never encoded"
+        );
+    }
+
+    /// Shares a [`TestFence`] with the sync point that takes it.
+    #[derive(Debug)]
+    struct TestFenceRef(Arc<TestFence>);
+
+    impl smithay::backend::renderer::sync::Fence for TestFenceRef {
+        fn is_signaled(&self) -> bool {
+            self.0.is_signaled()
+        }
+        fn wait(&self) -> Result<(), smithay::backend::renderer::sync::Interrupted> {
+            Ok(())
+        }
+        fn is_exportable(&self) -> bool {
+            false
+        }
+        fn export(&self) -> Option<std::os::fd::OwnedFd> {
+            None
         }
     }
 

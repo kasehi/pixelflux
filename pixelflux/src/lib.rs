@@ -3181,6 +3181,203 @@ fn read_back_rgba(
     }
 }
 
+/// `glBufferStorageEXT`, which GLES has only through `GL_EXT_buffer_storage`.
+type BufferStorageFn = unsafe extern "system" fn(u32, isize, *const std::ffi::c_void, u32);
+
+const GL_MAP_READ_BIT: u32 = 0x0001;
+const GL_MAP_PERSISTENT_BIT_EXT: u32 = 0x0040;
+const GL_MAP_COHERENT_BIT_EXT: u32 = 0x0080;
+const GL_CLIENT_STORAGE_BIT_EXT: u32 = 0x0200;
+/// Pixel-pack buffers kept at once, as many screenshots as the process admits.
+const READBACK_SLOTS_MAX: usize = computer_use::MAX_SCREENSHOT_REQUESTS;
+/// How long an unused pixel-pack buffer is kept for the next screenshot.
+const READBACK_SLOT_IDLE: Duration = Duration::from_secs(10);
+
+/// The persistently mapped pixel-pack buffers GLES screenshots are read back into, so the
+/// compositor only issues the transfer and the caller copies the pixels out once the GPU has
+/// written them. Without `GL_EXT_buffer_storage`, or with `PIXELFLUX_SCREENSHOT_SYNC` set, the
+/// compositor reads back synchronously into the caller's buffer instead. Declared ahead of the
+/// renderer in [`AppState`](wayland::frontend::AppState), so its drop forgets every mapping, waiting
+/// out a copy under way, before the GL context goes away.
+#[derive(Default)]
+pub(crate) struct ScreenshotReadbacks {
+    slots: Vec<(Arc<computer_use::ReadbackSlot>, Instant)>,
+    /// The entry point, once looked up: `None` before the first GLES screenshot.
+    storage: Option<Option<BufferStorageFn>>,
+}
+
+impl ScreenshotReadbacks {
+    fn lookup(gl: &smithay::backend::renderer::gles::ffi::Gles2) -> Option<BufferStorageFn> {
+        if std::env::var_os("PIXELFLUX_SCREENSHOT_SYNC").is_some_and(|v| !v.is_empty() && v != "0")
+        {
+            return None;
+        }
+        // SAFETY: GL_EXTENSIONS is a NUL-terminated string the context owns.
+        let extensions = unsafe {
+            let names = gl.GetString(smithay::backend::renderer::gles::ffi::EXTENSIONS);
+            if names.is_null() {
+                return None;
+            }
+            std::ffi::CStr::from_ptr(names as *const std::ffi::c_char)
+                .to_string_lossy()
+                .into_owned()
+        };
+        if !extensions
+            .split(' ')
+            .any(|name| name == "GL_EXT_buffer_storage")
+        {
+            return None;
+        }
+        // SAFETY: a non-null address of the extension's entry point has its signature.
+        unsafe {
+            let address = smithay::backend::egl::get_proc_address("glBufferStorageEXT");
+            (!address.is_null())
+                .then(|| std::mem::transmute::<*const std::ffi::c_void, BufferStorageFn>(address))
+        }
+    }
+
+    /// A free slot of `len` bytes, made when none is; `None` sends the screenshot down the
+    /// synchronous readback.
+    fn acquire(
+        &mut self,
+        gl: &smithay::backend::renderer::gles::ffi::Gles2,
+        len: usize,
+        now: Instant,
+    ) -> Option<Arc<computer_use::ReadbackSlot>> {
+        let storage = (*self.storage.get_or_insert_with(|| Self::lookup(gl)))?;
+        if let Some((slot, used)) = self
+            .slots
+            .iter_mut()
+            .find(|(slot, _)| !slot.in_use() && slot.size == len)
+        {
+            *used = now;
+            return Some(Arc::clone(slot));
+        }
+        if self.slots.len() >= READBACK_SLOTS_MAX {
+            let free = self.slots.iter().position(|(slot, _)| !slot.in_use())?;
+            Self::delete(gl, &self.slots.swap_remove(free).0);
+        }
+        let slot = Arc::new(Self::create(gl, storage, len)?);
+        self.slots.push((Arc::clone(&slot), now));
+        Some(slot)
+    }
+
+    fn create(
+        gl: &smithay::backend::renderer::gles::ffi::Gles2,
+        storage: BufferStorageFn,
+        len: usize,
+    ) -> Option<computer_use::ReadbackSlot> {
+        use smithay::backend::renderer::gles::ffi;
+        let size = isize::try_from(len).ok()?;
+        let access = GL_MAP_READ_BIT | GL_MAP_PERSISTENT_BIT_EXT | GL_MAP_COHERENT_BIT_EXT;
+        // SAFETY: plain GL calls on the current context; the mapping is checked before use.
+        unsafe {
+            let mut id = 0;
+            gl.GenBuffers(1, &mut id);
+            gl.BindBuffer(ffi::PIXEL_PACK_BUFFER, id);
+            storage(
+                ffi::PIXEL_PACK_BUFFER,
+                size,
+                std::ptr::null(),
+                access | GL_CLIENT_STORAGE_BIT_EXT,
+            );
+            let ptr = gl.MapBufferRange(ffi::PIXEL_PACK_BUFFER, 0, size, access);
+            gl.BindBuffer(ffi::PIXEL_PACK_BUFFER, 0);
+            if ptr.is_null() || gl.GetError() != ffi::NO_ERROR {
+                gl.DeleteBuffers(1, &id);
+                return None;
+            }
+            Some(computer_use::ReadbackSlot::new(id, ptr as *const u8, len))
+        }
+    }
+
+    fn delete(
+        gl: &smithay::backend::renderer::gles::ffi::Gles2,
+        slot: &computer_use::ReadbackSlot,
+    ) {
+        use smithay::backend::renderer::gles::ffi;
+        slot.unmap();
+        // SAFETY: the slot is free and forgotten, so nothing reads the mapping any more.
+        unsafe {
+            gl.BindBuffer(ffi::PIXEL_PACK_BUFFER, slot.id);
+            gl.UnmapBuffer(ffi::PIXEL_PACK_BUFFER);
+            gl.BindBuffer(ffi::PIXEL_PACK_BUFFER, 0);
+            gl.DeleteBuffers(1, &slot.id);
+        }
+    }
+
+    /// Whether a free slot has gone unused long enough to be deleted.
+    fn has_idle(&self, now: Instant) -> bool {
+        self.slots
+            .iter()
+            .any(|(slot, used)| !slot.in_use() && now.duration_since(*used) >= READBACK_SLOT_IDLE)
+    }
+
+    fn reap_idle(&mut self, gl: &smithay::backend::renderer::gles::ffi::Gles2, now: Instant) {
+        self.slots.retain(|(slot, used)| {
+            let idle = !slot.in_use() && now.duration_since(*used) >= READBACK_SLOT_IDLE;
+            if idle {
+                Self::delete(gl, slot);
+            }
+            !idle
+        });
+    }
+}
+
+impl Drop for ScreenshotReadbacks {
+    fn drop(&mut self) {
+        for (slot, _) in &self.slots {
+            slot.unmap();
+        }
+    }
+}
+
+/// Start reading the bound target back into a pixel-pack buffer and return the readback the
+/// caller waits for, or `None` where the buffers are unavailable.
+fn read_back_rgba_async(
+    renderer: &mut GlesRenderer,
+    readbacks: &mut ScreenshotReadbacks,
+    target: &mut smithay::backend::renderer::gles::GlesTarget<'_>,
+    width: i32,
+    height: i32,
+) -> Option<Result<computer_use::GpuReadback, String>> {
+    use smithay::backend::renderer::gles::ffi;
+    let len = screenshot_len(width, height)?;
+    let now = Instant::now();
+    let slot = renderer
+        .with_context(|gl| readbacks.acquire(gl, len, now))
+        .ok()??;
+    Some((|| {
+        let mut frame = renderer
+            .render(target, (width, height).into(), Transform::Normal)
+            .map_err(|e| format!("Screenshot readback failed: {e:?}"))?;
+        let error = frame
+            .with_context(|gl| unsafe {
+                gl.BindBuffer(ffi::PIXEL_PACK_BUFFER, slot.id);
+                gl.ReadPixels(
+                    0,
+                    0,
+                    width,
+                    height,
+                    ffi::RGBA,
+                    ffi::UNSIGNED_BYTE,
+                    std::ptr::null_mut(),
+                );
+                gl.BindBuffer(ffi::PIXEL_PACK_BUFFER, 0);
+                gl.GetError()
+            })
+            .map_err(|e| format!("Screenshot readback failed: {e:?}"))?;
+        if error != ffi::NO_ERROR {
+            return Err(format!("Screenshot readback GL error: 0x{error:x}"));
+        }
+        // The frame's fence follows the transfer, so the caller waits for exactly that.
+        let sync = frame
+            .finish()
+            .map_err(|e| format!("Screenshot readback failed: {e:?}"))?;
+        Ok(computer_use::GpuReadback { slot, sync, len })
+    })())
+}
+
 /// Screenshot reads also check GL errors before any pixels can be handed to the caller.
 fn read_back_rgba_result(
     renderer: &mut GlesRenderer,
@@ -3224,6 +3421,8 @@ enum ShotPixels {
     Rendered,
     /// Already in the buffer the caller receives.
     Owned(computer_use::ScreenshotBuffer),
+    /// On their way from the GPU, for the caller to wait for and copy out.
+    Gpu(computer_use::GpuReadback),
 }
 
 /// The byte length of one `width` x `height` RGBA frame, `None` for an empty or overflowing one.
@@ -3299,6 +3498,35 @@ mod screenshot_frame_tests {
     use crate::wayland::host::HostCpuFrame;
     use smithay::reexports::wayland_server::protocol::wl_shm;
     use std::sync::Arc;
+
+    #[test]
+    fn screenshot_readbacks_forget_their_mappings_before_the_context_goes() {
+        let mapping = [0u8; 8];
+        // SAFETY: `mapping` outlives the copies below.
+        let slot = Arc::new(unsafe {
+            crate::computer_use::ReadbackSlot::new(3, mapping.as_ptr(), mapping.len())
+        });
+        let held = Arc::clone(&slot);
+        let then = std::time::Instant::now();
+        let mut readbacks = super::ScreenshotReadbacks::default();
+        readbacks.slots.push((slot, then));
+        // A slot a screenshot holds is never idle; a free one is, once unused long enough.
+        assert!(!readbacks.has_idle(then + super::READBACK_SLOT_IDLE));
+        drop(readbacks);
+        assert_eq!(
+            held.copy_out(8).err().as_deref(),
+            Some("Screenshot compositor stopped"),
+            "a screenshot still holding a slot cannot read a mapping its context let go"
+        );
+        let mut idle = super::ScreenshotReadbacks::default();
+        // SAFETY: as above.
+        let free = Arc::new(unsafe {
+            crate::computer_use::ReadbackSlot::new(4, mapping.as_ptr(), mapping.len())
+        });
+        idle.slots.push((free, then));
+        assert!(!idle.has_idle(then));
+        assert!(idle.has_idle(then + super::READBACK_SLOT_IDLE));
+    }
 
     #[test]
     fn screenshot_owns_only_the_current_frame_pixels() {
@@ -4064,6 +4292,17 @@ fn render_node_tick(
                                 // other slot across a tick; one catch-up readback keeps
                                 // every published buffer current.
                                 if render_success && take_screenshot {
+                                    screenshot_result = read_back_rgba_async(
+                                        renderer,
+                                        &mut state.screenshot_readbacks,
+                                        &mut frame,
+                                        width,
+                                        height,
+                                    )
+                                    .map(|readback| readback.map(ShotPixels::Gpu));
+                                }
+                                if render_success && take_screenshot && screenshot_result.is_none()
+                                {
                                     let result = read_back_rgba_result(
                                         renderer, &mut frame, width, height, buf, true,
                                     );
@@ -4082,6 +4321,20 @@ fn render_node_tick(
                             }
                         }
                         if render_success && pool_slot.is_none() && take_screenshot {
+                            screenshot_result = read_back_rgba_async(
+                                renderer,
+                                &mut state.screenshot_readbacks,
+                                &mut frame,
+                                width,
+                                height,
+                            )
+                            .map(|readback| readback.map(ShotPixels::Gpu));
+                        }
+                        if render_success
+                            && pool_slot.is_none()
+                            && take_screenshot
+                            && screenshot_result.is_none()
+                        {
                             let mut pixels = computer_use::ScreenshotBuffer::with_len(
                                 screenshot_len(width, height).unwrap_or(0),
                             );
@@ -4642,8 +4895,11 @@ fn render_node_tick(
                     return Err("Screenshot render failed".to_string());
                 }
                 let pixels = match pixels {
-                    ShotPixels::Owned(pixels) => pixels,
-                    ShotPixels::Rendered => screenshot_pixels(&node.frame_buffer, width, height)?,
+                    ShotPixels::Owned(pixels) => computer_use::ScreenshotPixels::Ready(pixels),
+                    ShotPixels::Rendered => computer_use::ScreenshotPixels::Ready(
+                        screenshot_pixels(&node.frame_buffer, width, height)?,
+                    ),
+                    ShotPixels::Gpu(readback) => computer_use::ScreenshotPixels::Gpu(readback),
                 };
                 Ok(computer_use::ScreenshotFrame {
                     pixels,
@@ -5723,6 +5979,7 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
         render_node_path,
         auto_gpu_selected,
         pending_screenshots: wayland::frontend::ScreenshotQueue::default(),
+        screenshot_readbacks: ScreenshotReadbacks::default(),
         command_rx: None,
         last_input_at: None,
         pointer_motion_at: None,
@@ -6790,6 +7047,12 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                 } else {
                     i += 1;
                 }
+            }
+            if state.screenshot_readbacks.has_idle(Instant::now())
+                && let Some(renderer) = state.gles_renderer.as_mut()
+            {
+                let readbacks = &mut state.screenshot_readbacks;
+                let _ = renderer.with_context(|gl| readbacks.reap_idle(gl, Instant::now()));
             }
             let loop_start_time = Instant::now();
             state.space.refresh();
