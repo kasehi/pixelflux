@@ -3218,30 +3218,37 @@ fn read_back_rgba_result(
     Ok(())
 }
 
-/// Copy exactly one complete frame, excluding any scratch-buffer capacity from an older size.
-fn screenshot_frame(
-    pixels: &[u8],
-    width: i32,
-    height: i32,
-    format: computer_use::ScreenshotPixelFormat,
-) -> Result<computer_use::ScreenshotFrame, String> {
-    let expected = usize::try_from(width)
+/// Where a screenshot's pixels are once its output has rendered.
+enum ShotPixels {
+    /// The render's own CPU pixels: the pool slot while one is held, else the frame buffer.
+    Rendered,
+    /// Already in the buffer the caller receives.
+    Owned(computer_use::ScreenshotBuffer),
+}
+
+/// The byte length of one `width` x `height` RGBA frame, `None` for an empty or overflowing one.
+fn screenshot_len(width: i32, height: i32) -> Option<usize> {
+    usize::try_from(width)
         .ok()
         .zip(usize::try_from(height).ok())
         .filter(|(w, h)| *w > 0 && *h > 0)
         .and_then(|(w, h)| w.checked_mul(h))
         .and_then(|n| n.checked_mul(4))
+}
+
+/// Copy exactly one complete frame into a caller's buffer, excluding any scratch-buffer
+/// capacity from an older size.
+fn screenshot_pixels(
+    pixels: &[u8],
+    width: i32,
+    height: i32,
+) -> Result<computer_use::ScreenshotBuffer, String> {
+    let expected = screenshot_len(width, height)
         .ok_or_else(|| "Screenshot dimensions are invalid".to_string())?;
     let pixels = pixels
         .get(..expected)
-        .ok_or_else(|| "Screenshot readback produced incomplete pixels".to_string())?
-        .to_vec();
-    Ok(computer_use::ScreenshotFrame {
-        pixels,
-        width: width as u32,
-        height: height as u32,
-        format,
-    })
+        .ok_or_else(|| "Screenshot readback produced incomplete pixels".to_string())?;
+    Ok(computer_use::ScreenshotBuffer::copy_of(pixels))
 }
 
 /// Reject truncated host mappings instead of retaining pixels from an earlier frame.
@@ -3287,7 +3294,7 @@ fn validate_host_screenshot(
 
 #[cfg(test)]
 mod screenshot_frame_tests {
-    use super::{screenshot_frame, validate_host_screenshot};
+    use super::{screenshot_pixels, validate_host_screenshot};
     use crate::computer_use::ScreenshotPixelFormat;
     use crate::wayland::host::HostCpuFrame;
     use smithay::reexports::wayland_server::protocol::wl_shm;
@@ -3296,19 +3303,15 @@ mod screenshot_frame_tests {
     #[test]
     fn screenshot_owns_only_the_current_frame_pixels() {
         let mut source = vec![1, 2, 3, 4, 5, 6, 7, 8, 99, 99, 99, 99];
-        let frame = screenshot_frame(&source, 2, 1, ScreenshotPixelFormat::Bgra).unwrap();
+        let pixels = screenshot_pixels(&source, 2, 1).unwrap();
         source.fill(0);
-        assert_eq!(frame.pixels, [1, 2, 3, 4, 5, 6, 7, 8]);
-        assert_eq!((frame.width, frame.height), (2, 1));
-        assert!(matches!(frame.format, ScreenshotPixelFormat::Bgra));
+        assert_eq!(&*pixels, [1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
     #[test]
     fn screenshot_rejects_invalid_dimensions_and_short_pixels() {
         for (width, height) in [(0, 1), (1, 0), (-1, 2), (2, -1), (2, 2)] {
-            assert!(
-                screenshot_frame(&[0; 12], width, height, ScreenshotPixelFormat::Rgba).is_err()
-            );
+            assert!(screenshot_pixels(&[0; 12], width, height).is_err());
         }
     }
 
@@ -3720,6 +3723,7 @@ fn render_node_tick(
                     screenshot_result = Some(if (f.width, f.height) == (width, height) {
                         validate_host_screenshot(cpu, width, height).map(|format| {
                             screenshot_format = format;
+                            ShotPixels::Rendered
                         })
                     } else {
                         Err("Screenshot host frame has stale dimensions".to_string())
@@ -3814,12 +3818,12 @@ fn render_node_tick(
                     let data = renderer
                         .map_texture(&mapping)
                         .map_err(|e| format!("Screenshot map failed: {e:?}"))?;
-                    let expected = width as usize * height as usize * 4;
-                    if data.len() != expected {
+                    if Some(data.len()) != screenshot_len(width, height) {
                         return Err("Screenshot readback produced incomplete pixels".to_string());
                     }
-                    node.frame_buffer[..expected].copy_from_slice(data);
-                    Ok(())
+                    Ok(ShotPixels::Owned(computer_use::ScreenshotBuffer::copy_of(
+                        data,
+                    )))
                 })());
             }
         }
@@ -4069,7 +4073,7 @@ fn render_node_tick(
                                         render_success = false;
                                         c.needs_full_render = true;
                                     }
-                                    screenshot_result = Some(result);
+                                    screenshot_result = Some(result.map(|()| ShotPixels::Rendered));
                                 } else if render_success && c.pool_content_gen[id] != c.content_gen
                                 {
                                     read_back_rgba(renderer, &mut frame, width, height, buf);
@@ -4078,14 +4082,20 @@ fn render_node_tick(
                             }
                         }
                         if render_success && pool_slot.is_none() && take_screenshot {
-                            screenshot_result = Some(read_back_rgba_result(
-                                renderer,
-                                &mut frame,
-                                width,
-                                height,
-                                &mut node.frame_buffer,
-                                true,
-                            ));
+                            let mut pixels = computer_use::ScreenshotBuffer::with_len(
+                                screenshot_len(width, height).unwrap_or(0),
+                            );
+                            screenshot_result = Some(
+                                read_back_rgba_result(
+                                    renderer,
+                                    &mut frame,
+                                    width,
+                                    height,
+                                    &mut pixels,
+                                    true,
+                                )
+                                .map(|()| ShotPixels::Owned(pixels)),
+                            );
                         }
                     }
                     Err(e) => eprintln!("Failed to bind buffer: {:?}", e),
@@ -4289,20 +4299,13 @@ fn render_node_tick(
 
     if take_screenshot && render_success {
         if !host_mode && !state.use_gpu {
-            screenshot_result = Some(Ok(()));
+            screenshot_result = Some(Ok(ShotPixels::Rendered));
         }
         if !host_mode
-            && matches!(&screenshot_result, Some(Ok(())))
+            && matches!(&screenshot_result, Some(Ok(ShotPixels::Rendered)))
             && let Some((_, buf)) = pool_slot.as_ref()
         {
-            let expected = width as usize * height as usize * 4;
-            if let Some(pixels) = buf.get(..expected) {
-                node.frame_buffer[..expected].copy_from_slice(pixels);
-            } else {
-                screenshot_result = Some(Err(
-                    "Screenshot readback produced incomplete pixels".to_string()
-                ));
-            }
+            screenshot_result = Some(screenshot_pixels(buf, width, height).map(ShotPixels::Owned));
         }
     }
     if render_success {
@@ -4634,11 +4637,20 @@ fn render_node_tick(
     {
         let result = screenshot_result
             .unwrap_or_else(|| Err("Screenshot render produced no pixels".to_string()))
-            .and_then(|()| {
+            .and_then(|pixels| {
                 if !render_success {
                     return Err("Screenshot render failed".to_string());
                 }
-                screenshot_frame(&node.frame_buffer, width, height, screenshot_format)
+                let pixels = match pixels {
+                    ShotPixels::Owned(pixels) => pixels,
+                    ShotPixels::Rendered => screenshot_pixels(&node.frame_buffer, width, height)?,
+                };
+                Ok(computer_use::ScreenshotFrame {
+                    pixels,
+                    width: width as u32,
+                    height: height as u32,
+                    format: screenshot_format,
+                })
             });
         let result = if request.canceled.load(Ordering::Acquire) {
             Err("Screenshot canceled".to_string())

@@ -79,10 +79,95 @@ pub enum ScreenshotPixelFormat {
     Bgrx,
 }
 
+/// The pixel buffers screenshots hand to their callers, kept when a caller is done with one so
+/// the next screenshot neither allocates nor faults in a whole frame (33 MB at 4K) on the
+/// compositor. Two are kept, as many as one display admits at once.
+pub(crate) struct ScreenshotBuffers {
+    kept: Mutex<Vec<Vec<u8>>>,
+}
+
+const SCREENSHOT_BUFFERS_KEPT: usize = MAX_SCREENSHOT_REQUESTS_PER_DISPLAY;
+
+static SCREENSHOT_BUFFERS: ScreenshotBuffers = ScreenshotBuffers::new();
+
+impl ScreenshotBuffers {
+    const fn new() -> Self {
+        Self {
+            kept: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn take(&'static self, len: usize) -> ScreenshotBuffer {
+        let mut pixels = self.kept.lock().unwrap().pop().unwrap_or_default();
+        // Only bytes past a kept buffer's length are written: every caller fills it whole.
+        if pixels.len() > len {
+            pixels.truncate(len);
+        } else {
+            pixels.resize(len, 0);
+        }
+        ScreenshotBuffer { pixels, home: self }
+    }
+
+    fn keep(&self, pixels: Vec<u8>) {
+        let mut kept = self.kept.lock().unwrap();
+        if kept.len() < SCREENSHOT_BUFFERS_KEPT && pixels.capacity() > 0 {
+            kept.push(pixels);
+        }
+    }
+}
+
+/// One screenshot's pixels, returned to the kept buffers when dropped.
+pub struct ScreenshotBuffer {
+    pixels: Vec<u8>,
+    home: &'static ScreenshotBuffers,
+}
+
+impl ScreenshotBuffer {
+    /// A buffer of `len` bytes for the caller to fill whole.
+    pub(crate) fn with_len(len: usize) -> Self {
+        SCREENSHOT_BUFFERS.take(len)
+    }
+
+    /// A buffer holding a copy of `pixels`.
+    pub(crate) fn copy_of(pixels: &[u8]) -> Self {
+        let mut buffer = Self::with_len(pixels.len());
+        buffer.copy_from_slice(pixels);
+        buffer
+    }
+}
+
+impl From<Vec<u8>> for ScreenshotBuffer {
+    fn from(pixels: Vec<u8>) -> Self {
+        Self {
+            pixels,
+            home: &SCREENSHOT_BUFFERS,
+        }
+    }
+}
+
+impl std::ops::Deref for ScreenshotBuffer {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.pixels
+    }
+}
+
+impl std::ops::DerefMut for ScreenshotBuffer {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        &mut self.pixels
+    }
+}
+
+impl Drop for ScreenshotBuffer {
+    fn drop(&mut self) {
+        self.home.keep(std::mem::take(&mut self.pixels));
+    }
+}
+
 /// An owned copy of one rendered output, independent of the streaming buffer pool.
 /// Channel conversion and PNG compression run in the requesting thread.
 pub struct ScreenshotFrame {
-    pub pixels: Vec<u8>,
+    pub pixels: ScreenshotBuffer,
     pub width: u32,
     pub height: u32,
     pub format: ScreenshotPixelFormat,
@@ -1625,7 +1710,8 @@ mod record_path_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        ScreenshotAdmission, ScreenshotFrame, ScreenshotPixelFormat, cu_listeners, encode_png_rgba,
+        ScreenshotAdmission, ScreenshotBuffers, ScreenshotFrame, ScreenshotPixelFormat,
+        cu_listeners, encode_png_rgba,
     };
     use std::io::Cursor;
     use std::net::{IpAddr, Ipv4Addr, TcpListener};
@@ -1652,7 +1738,7 @@ mod tests {
                 }
             }
             let png = ScreenshotFrame {
-                pixels,
+                pixels: pixels.into(),
                 width: 17,
                 height: 11,
                 format,
@@ -1677,7 +1763,7 @@ mod tests {
         ] {
             assert!(
                 ScreenshotFrame {
-                    pixels: vec![0; len],
+                    pixels: vec![0; len].into(),
                     width,
                     height,
                     format: ScreenshotPixelFormat::Rgba,
@@ -1698,7 +1784,7 @@ mod tests {
                 }
             }
             let png = ScreenshotFrame {
-                pixels,
+                pixels: pixels.into(),
                 width: 3,
                 height: 1,
                 format,
@@ -1711,6 +1797,24 @@ mod tests {
                 [11, 22, 33, 255, 44, 55, 66, 255, 77, 88, 99, 255]
             );
         }
+    }
+
+    #[test]
+    fn screenshot_buffers_are_kept_for_the_next_screenshot_and_bounded() {
+        static BUFFERS: ScreenshotBuffers = ScreenshotBuffers::new();
+        let first = BUFFERS.take(64);
+        assert_eq!(first.len(), 64);
+        let address = first.as_ptr();
+        drop(first);
+        // The kept buffer comes back, cut to a smaller frame or grown for a larger one.
+        let again = BUFFERS.take(16);
+        assert_eq!((again.len(), again.as_ptr()), (16, address));
+        drop(again);
+        let grown = BUFFERS.take(4096);
+        assert_eq!(grown.len(), 4096);
+        let held: Vec<_> = (0..4).map(|_| BUFFERS.take(8)).collect();
+        drop((grown, held));
+        assert_eq!(BUFFERS.kept.lock().unwrap().len(), 2);
     }
 
     #[test]
