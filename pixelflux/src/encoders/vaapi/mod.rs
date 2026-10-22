@@ -830,6 +830,10 @@ pub(super) struct Negotiated {
     /// The finest quantizer the entry point codes a constant-quantizer picture at
     /// (`h265::INTEL_LOW_POWER_MIN_QP` on Intel's low-power HEVC encoder, 1 elsewhere).
     pub qp_floor: u32,
+    /// Whether the driver's rate control codes its quantizer in every coding unit as a delta
+    /// from the slice's (Intel's full HEVC encoder), which the slice's quantizer then has to keep
+    /// within the syntax's range (`h265::Arm::configure`).
+    pub unit_qp_deltas: bool,
 }
 
 /// One frame as the codec arms see it: what it is, where its reconstruction and coded output
@@ -1198,6 +1202,9 @@ impl VaapiEncoder {
                 .min(super::reference_frames(settings)),
             _ => REFERENCE_FRAMES,
         };
+        let unit_qp_deltas = codec == Codec::H265
+            && device.hardware() == Hardware::VaapiIntel
+            && entrypoint == VAEntrypointEncSlice;
         let mut arm = match codec {
             Codec::H264 => Arm::H264(Box::new(h264::Arm::new(profile))),
             Codec::H265 => Arm::H265(h265::Arm::new(
@@ -1205,6 +1212,7 @@ impl VaapiEncoder {
                 device.attribute(profile, entrypoint, VAConfigAttribEncHEVCFeatures),
                 device.attribute(profile, entrypoint, VAConfigAttribEncHEVCBlockSizes),
                 device.attribute(profile, entrypoint, VAConfigAttribPredictionDirection),
+                unit_qp_deltas,
             )),
             Codec::Vp8 => Arm::Vp8(vp8::Arm::new()),
             Codec::Vp9 => Arm::Vp9(vp9::Arm::new()),
@@ -1287,6 +1295,7 @@ impl VaapiEncoder {
                 } else {
                     1
                 },
+                unit_qp_deltas,
             },
             fourcc,
             rt_format,
@@ -1940,7 +1949,13 @@ impl VaapiEncoder {
             } else {
                 self.negotiated.min_qp
             };
-            rc.max_qp = self.negotiated.max_qp;
+            // Intel's full encoder takes 0 for no bound, under which a coding unit can name a
+            // quantizer past 51; its low-power one reads 0 as 51 itself.
+            rc.max_qp = if self.negotiated.unit_qp_deltas && self.negotiated.max_qp == 0 {
+                51
+            } else {
+                self.negotiated.max_qp
+            };
             rc.basic_unit_size = 0;
             rc.ICQ_quality_factor = 1;
             rc.quality_factor = 0;

@@ -26,6 +26,16 @@ const LOG2_MAX_POC_LSB_MINUS4: u32 = 8;
 /// delta.
 const PIC_INIT_QP_CBR: u32 = 30;
 const PIC_INIT_QP_CQP: u32 = 26;
+
+/// The quantizer a constant-rate slice names where the rate control codes its own in every
+/// coding unit as a delta from the slice's (Intel's full encoder): the middle of the range
+/// at `bit_depth`, from which a delta within the syntax's -(26 + QpBdOffsetY / 2) to
+/// 25 + QpBdOffsetY / 2 reaches every quantizer. From 30, a unit the rate control takes under
+/// 4 codes a delta past that range, which a strict decoder refuses and a lenient one decodes
+/// as garbage.
+fn centered_qp(bit_depth: u32) -> u32 {
+    26 - 3 * (bit_depth - 8)
+}
 /// The finest quantizer Intel's low-power HEVC encoder codes (the driver's
 /// `CODEC_HEVC_MIN_QP_LP`): a slice naming a finer one is coded at this one regardless, so the
 /// decoder dequantizes it too fine and the picture comes out washed out, the more so the finer
@@ -61,6 +71,10 @@ pub(super) struct Arm {
     dpb: u32,
     pic_init_qp: u32,
     cu_qp_delta: bool,
+    /// The depth of the coding units that each carry a quantizer delta, 0 for one per tree block.
+    cu_qp_delta_depth: u32,
+    /// The surface alignment, the smallest coding block but where `new` says otherwise.
+    align: u32,
     /// Whether a predicted frame is coded as a B slice with the one reference in both lists.
     low_delay_b: bool,
     sequence: VAEncSequenceParameterBufferHEVC,
@@ -69,12 +83,14 @@ pub(super) struct Arm {
 
 impl Arm {
     /// The arm on `profile`, with the driver's feature and block-size attributes where it
-    /// reports them.
+    /// reports them. Intel's full encoder (`unit_qp_deltas`), which reports no block sizes, codes
+    /// blocks from 8x8 to 32x32 (Skylake's, as FFmpeg's defaults say) on surfaces aligned to 16.
     pub(super) fn new(
         profile: VAProfile,
         features: Option<u32>,
         block_sizes: Option<u32>,
         prediction: Option<u32>,
+        unit_qp_deltas: bool,
     ) -> Self {
         let mut tools = Tools {
             ctu_size: 32,
@@ -90,6 +106,10 @@ impl Arm {
             transform_skip: false,
             cu_qp_delta: true,
         };
+        let mut align = tools.min_cb_size;
+        if unit_qp_deltas && block_sizes.is_none() {
+            tools.min_cb_size = 8;
+        }
         if let Some(value) = features {
             let f = VAConfigAttribValEncHEVCFeatures { value };
             unsafe {
@@ -112,6 +132,7 @@ impl Arm {
                 tools.max_th_depth_inter = b.bits.max_max_transform_hierarchy_depth_inter();
                 tools.max_th_depth_intra = b.bits.max_max_transform_hierarchy_depth_intra();
             }
+            align = tools.min_cb_size;
         }
         Self {
             profile,
@@ -124,15 +145,17 @@ impl Arm {
             dpb: 1,
             pic_init_qp: PIC_INIT_QP_CBR,
             cu_qp_delta: false,
+            cu_qp_delta_depth: 0,
+            align,
             low_delay_b: prediction.is_some_and(|p| p & VA_PREDICTION_DIRECTION_BI_NOT_EMPTY != 0),
             sequence: unsafe { std::mem::zeroed() },
             headers: Vec::new(),
         }
     }
 
-    /// The surface alignment: the smallest coding block.
+    /// The surface alignment: the smallest coding block, or 16 on Intel's full encoder.
     pub(super) fn alignment(&self) -> (u32, u32) {
-        (self.tools.min_cb_size, self.tools.min_cb_size)
+        (self.align, self.align)
     }
 
     pub(super) fn ctu_size(&self) -> u32 {
@@ -218,12 +241,17 @@ impl Arm {
         self.tier = h265_tier(self.level_idc);
         self.pic_init_qp = if n.rc_mode == VA_RC_CQP {
             PIC_INIT_QP_CQP
+        } else if n.unit_qp_deltas {
+            centered_qp(n.bit_depth)
         } else {
             PIC_INIT_QP_CBR
         };
         self.cu_qp_delta = n.rc_mode != VA_RC_CQP && t.cu_qp_delta;
         let log2_min_cb = t.min_cb_size.trailing_zeros();
         let log2_diff_cb = t.ctu_size.trailing_zeros() - log2_min_cb;
+        // A frame's units share the quantizer of Intel's full encoder's rate control, so one delta
+        // per tree block carries it, as FFmpeg codes there.
+        self.cu_qp_delta_depth = if n.unit_qp_deltas { 0 } else { log2_diff_cb };
         let chroma_shift = if n.fullcolor { 0 } else { 1 };
         let conformance = surface_width != n.width || surface_height != n.height;
 
@@ -348,7 +376,7 @@ impl Arm {
         w.flag(t.transform_skip);
         w.flag(self.cu_qp_delta);
         if self.cu_qp_delta {
-            w.ue(log2_diff_cb);
+            w.ue(self.cu_qp_delta_depth);
         }
         w.se(0);
         w.se(0);
@@ -463,7 +491,7 @@ impl Arm {
         pic.collocated_ref_pic_index = if t.temporal_mvp { 0 } else { 0xff };
         pic.pic_init_qp = self.pic_init_qp as u8;
         pic.diff_cu_qp_delta_depth = if self.cu_qp_delta {
-            (t.ctu_size.trailing_zeros() - t.min_cb_size.trailing_zeros()) as u8
+            self.cu_qp_delta_depth as u8
         } else {
             0
         };

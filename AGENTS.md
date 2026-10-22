@@ -233,7 +233,12 @@ and the hardware ones, were measured at those settings and must be re-measured w
 HEVC encoder codes no quantizer under 10 and codes a slice naming a finer one at 10 regardless, which decodes washed
 out, so a constant-quantizer session there is floored at 10 (`vaapi::h265::INTEL_LOW_POWER_MIN_QP`); its H.264
 codes such a slice at its own floor, header and all, and its rate control stays at or above it by itself, so neither
-takes the floor. VP9 carries 4:4:4 as profile 1 (libvpx 1.13 on) at the same limited range as its 4:2:0, so the decoder hint the
+takes the floor. Intel's full HEVC encoder (Gen9, Skylake to Comet Lake, which lists no low-power one) gets the
+headers FFmpeg codes there: where it reports no block sizes, blocks from 8x8 to 32x32 (Skylake's) on surfaces still
+aligned to 16, and one quantizer delta per tree block. Its rate control codes its quantizer in every coding unit as a
+delta from the slice's, so a constant-rate slice there names the middle of the quantizer range (26 at 8 bits,
+`vaapi::h265::centered_qp`) and the rate control is bounded at 51: from 30, a unit under 4 needs a delta past the
+syntax's -26, which decoders refuse or misdecode. VP9 carries 4:4:4 as profile 1 (libvpx 1.13 on) at the same limited range as its 4:2:0, so the decoder hint the
 client sends for it stays true. The CBR
 sessions of x264 and x265 cap the quantizer at 51: both libraries default to an out-of-spec range above
 it that forces macroblock skips on a VBV underflow, which freezes rows of a screen for a few frames, so a

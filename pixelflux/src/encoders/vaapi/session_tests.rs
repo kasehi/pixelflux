@@ -2035,6 +2035,98 @@ fn a_picture_is_coded_no_finer_than_the_floor() {
     }
 }
 
+/// Intel's full HEVC encoder, whose rate control codes its quantizer in every coding unit as a
+/// delta from the slice's, gets the headers FFmpeg codes there: where it reports no block sizes
+/// (Skylake's), blocks from 8x8 to 32x32 on surfaces still aligned to 16, and one delta per tree
+/// block; under a constant rate, a slice naming the middle of the quantizer range at the
+/// session's depth and a rate control bounded at 51, so every delta stays within the syntax's
+/// range. The low-power encoder and other drivers keep 16x16 blocks, a delta per block, 30, and
+/// the bounds asked.
+#[test]
+fn intels_full_hevc_encoder_gets_the_headers_ffmpeg_codes_there() {
+    let intel = Some(c"Intel iHD driver for Intel(R) Gen Graphics - 26.1.2 ()");
+    // A height of 8 lines past a multiple of 16: the surface shows the alignment.
+    let height = 232;
+    for (vendor, entrypoint, block_sizes, bit_depth, init_qp, max_qp, min_cb, depth, surface) in [
+        (intel, VAEntrypointEncSlice, false, 8, 26, 51, 8u32, 0, 240),
+        (intel, VAEntrypointEncSlice, false, 10, 20, 51, 8, 0, 240),
+        (intel, VAEntrypointEncSlice, true, 8, 26, 51, 8, 0, 232),
+        (intel, VAEntrypointEncSliceLP, false, 8, 30, 0, 16, 1, 240),
+        (None, VAEntrypointEncSlice, false, 8, 30, 0, 16, 1, 240),
+    ] {
+        let mut driver = ten_bit_driver();
+        driver.vendor = vendor;
+        driver.entrypoints = vec![entrypoint];
+        if !block_sizes {
+            driver.attributes.retain(|a| {
+                a.0 != VAConfigAttribEncHEVCBlockSizes && a.0 != VAConfigAttribEncHEVCFeatures
+            });
+        }
+        mock::reset(driver);
+        let mut s = settings(Codec::H265, true);
+        s.height = height;
+        s.video_bit_depth = bit_depth;
+        let mut enc = open(Codec::H265, &s).unwrap();
+        assert_eq!(enc.bit_depth(), bit_depth as u32);
+        let frame = vec![0x40; (W * height * 4) as usize];
+        enc.encode_host(&frame, (W * 4) as usize, false, 0, 25, true)
+            .unwrap();
+        let case = format!("{vendor:?} {entrypoint} block sizes {block_sizes} at {bit_depth} bits");
+        mock::with(|d| {
+            let seq: VAEncSequenceParameterBufferHEVC =
+                d.last_param(VAEncSequenceParameterBufferType).unwrap();
+            let min_cb_minus3 = min_cb.trailing_zeros() - 3;
+            assert_eq!(
+                (
+                    seq.log2_min_luma_coding_block_size_minus3 as u32,
+                    seq.log2_diff_max_min_luma_coding_block_size as u32,
+                    seq.pic_height_in_luma_samples as i32,
+                ),
+                (min_cb_minus3, 2 - min_cb_minus3, surface),
+                "blocks from {min_cb} to 32 on a surface of {surface} lines, {case}"
+            );
+            let pic: VAEncPictureParameterBufferHEVC =
+                d.last_param(VAEncPictureParameterBufferType).unwrap();
+            assert_eq!(pic.pic_init_qp as u32, init_qp, "{case}");
+            assert_eq!(pic.diff_cu_qp_delta_depth as u32, depth, "{case}");
+            unsafe {
+                assert_eq!(pic.pic_fields.bits.cu_qp_delta_enabled_flag(), 1, "{case}");
+            }
+            let slice: VAEncSliceParameterBufferHEVC =
+                d.last_param(VAEncSliceParameterBufferType).unwrap();
+            assert_eq!(slice.slice_qp_delta, 0, "{case}");
+            let headers = d
+                .last_packed()
+                .into_iter()
+                .find(|p| p.0 == VAEncPackedHeaderSequence)
+                .unwrap()
+                .1;
+            let rbsp = nal(&headers, 34, true);
+            let mut r = Reader {
+                bytes: &rbsp,
+                pos: 0,
+            };
+            assert_eq!(r.ue(), 0, "pps id");
+            assert_eq!(r.ue(), 0, "sps id");
+            r.u(1 + 1 + 3 + 1 + 1);
+            r.ue();
+            r.ue();
+            assert_eq!(r.se(), init_qp as i32 - 26, "init_qp_minus26, {case}");
+            r.u(1 + 1);
+            assert_eq!(r.u(1), 1, "cu_qp_delta_enabled_flag, {case}");
+            assert_eq!(r.ue(), depth, "diff_cu_qp_delta_depth, {case}");
+            let (_, bytes) = d
+                .last_misc()
+                .into_iter()
+                .find(|m| m.0 == VAEncMiscParameterTypeRateControl)
+                .unwrap();
+            let rc: VAEncMiscParameterRateControl =
+                unsafe { ptr::read_unaligned(bytes.as_ptr() as *const _) };
+            assert_eq!((rc.min_qp, rc.max_qp), (0, max_qp), "{case}");
+        });
+    }
+}
+
 /// A constant-rate session caps each coded frame at its buffer where the driver takes a cap,
 /// and sends none where it does not.
 #[test]
