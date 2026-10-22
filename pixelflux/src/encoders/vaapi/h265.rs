@@ -36,8 +36,10 @@ const PIC_INIT_QP_CQP: u32 = 26;
 fn centered_qp(bit_depth: u32) -> u32 {
     26 - 3 * (bit_depth - 8)
 }
-/// The finest quantizer Intel's low-power HEVC encoder codes (the driver's
-/// `CODEC_HEVC_MIN_QP_LP`): a slice naming a finer one is coded at this one regardless, so the
+
+/// The finest quantizer Intel's low-power HEVC encoder codes: the driver clips the slice's to
+/// 10..51 when it programs VDENC and looks its rate tables up from 10, and its rate control floors
+/// its own minimum at 10. A slice naming a finer one is coded at this one regardless, so the
 /// decoder dequantizes it too fine and the picture comes out washed out, the more so the finer
 /// the slice names (31 dB at 9 and 16 dB at 2 against 59 dB at 10, Arc A750).
 pub(super) const INTEL_LOW_POWER_MIN_QP: u32 = 10;
