@@ -3983,6 +3983,52 @@ mod qp_bound_sweep {
         assert_eq!(h264_frame_type(&out), FRAME_KEY);
     }
 
+    /// A frame rate at or below the one a session opened at reaches the running encoder, so the
+    /// frame after a drop to 30 and the one after the return to 60 predict from the frame before
+    /// rather than starting the picture again from a key frame; a rate above it reopens.
+    #[cfg(feature = "gpl")]
+    #[test]
+    fn x264_keeps_its_session_across_a_frame_rate_change() {
+        use crate::encoders::codec::{FRAME_DELTA, FRAME_KEY, h264_frame_type};
+        use crate::encoders::reference::Reference;
+        let (u, v) = (vec![128u8; W * H / 4], vec![128u8; W * H / 4]);
+        let encode = |enc: &mut H264EncoderWrapper, i: usize| {
+            let mut out = Vec::new();
+            assert!(enc.encode_with_headers(
+                &text_luma(i),
+                &u,
+                &v,
+                W as i32,
+                (W / 2) as i32,
+                (W / 2) as i32,
+                i as u16,
+                0,
+                i == 0,
+                true,
+                &mut out
+            ));
+            (h264_frame_type(&out), enc.last_reference())
+        };
+        let mut enc =
+            H264EncoderWrapper::new(W as i32, H as i32, 25, false, 60.0, 1, true, 4000, 100, 0, 0)
+                .expect("x264 init");
+        for i in 0..4 {
+            encode(&mut enc, i);
+        }
+        enc.reconfigure_rate(4000, 200, 30.0);
+        assert_eq!(encode(&mut enc, 4), (FRAME_DELTA, Reference::Frame(3)), "after 30");
+        enc.reconfigure_rate(4000, 100, 60.0);
+        assert_eq!(encode(&mut enc, 5), (FRAME_DELTA, Reference::Frame(4)), "after 60");
+        let mut enc =
+            H264EncoderWrapper::new(W as i32, H as i32, 25, false, 30.0, 1, true, 4000, 200, 0, 0)
+                .expect("x264 init");
+        for i in 0..4 {
+            encode(&mut enc, i);
+        }
+        enc.reconfigure_rate(4000, 100, 60.0);
+        assert_eq!(encode(&mut enc, 4).0, FRAME_KEY, "above the rate it opened at");
+    }
+
     /// A session told to keep one reference frame (`video_reference_frames`) declares a decoded
     /// picture buffer of one, and a loss of the frame before the last is a key frame.
     #[cfg(feature = "gpl")]
@@ -4391,6 +4437,8 @@ mod qp_bound_sweep {
         let per_frame_60 = measure(&mut enc, 0);
         enc.reconfigure_rate(TARGET_KBPS, vbv(30.0), 30.0);
         let per_frame_30 = measure(&mut enc, 1000);
+        enc.reconfigure_rate(TARGET_KBPS, vbv(60.0), 60.0);
+        let per_frame_back = measure(&mut enc, 2000);
 
         let eff_60 = per_frame_60 * 8.0 * 60.0 / 1000.0;
         let eff_30 = per_frame_30 * 8.0 * 30.0 / 1000.0;
@@ -4406,6 +4454,11 @@ mod qp_bound_sweep {
         assert!(
             eff_30 > eff_60 * 0.75,
             "30fps effective bitrate {eff_30:.0} kbps collapsed from the 60fps {eff_60:.0} kbps; fps change did not re-budget the bitrate"
+        );
+        let back = per_frame_back / per_frame_60.max(1.0);
+        assert!(
+            (0.75..1.33).contains(&back),
+            "back at 60fps each frame is {per_frame_back:.0} B against {per_frame_60:.0} B before the drop (ratio {back:.2})"
         );
     }
 }
