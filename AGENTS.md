@@ -219,7 +219,9 @@ encoders and NVENC write the restriction, and the sessions whose device or drive
 M2M, Tegra) write it back where it is missing (`sps::bound_reorder`), each only where it proves its pictures leave
 in display order; the unit tests hold each encoder to it. Every session takes the capture's frame rate as the fraction
 it names (`encoders::frame_rate`: 59.94 is 60000/1001), never a whole number, so its rate control and the timing its
-stream declares hold to the rate the capture is paced at. Encoder settings are chosen by measured latency first, frame rate second, quality third, and
+stream declares hold to the rate the capture is paced at. x264 and SVT-AV1 take no new rate live, so a session there
+keeps running through a rate at or below the one it opened at, its bitrate scaled by the two so each frame keeps its
+budget, and declares the rate it opened at; a higher rate reopens it. Encoder settings are chosen by measured latency first, frame rate second, quality third, and
 bitrate last: every software encoder runs at the fastest setting its library offers in real time (x264
 ultrafast, VP8 speed 16, VP9 speed 8 with screen tuning, SVT-AV1 preset 11 in its real-time mode, a frame
 predicting from an anchor alone at preset 10, since preset 11 leaves some blocks the picture changed since the anchor

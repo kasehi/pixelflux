@@ -7,8 +7,9 @@
 //! Software AV1 through SVT-AV1 at preset 11 in its real-time mode (`PRESET`), one frame in and one
 //! packet out (two frames deep before 2.3), with rate control either constant-rate at the
 //! session's bitrate and VBV or a constant quantizer. A new bitrate reaches the running
-//! encoder with the next picture where the release takes one (`HAS_EVENTS`); a quality,
-//! frame-rate, or VBV change re-opens it, as a bitrate change does on an earlier release.
+//! encoder with the next picture where the release takes one (`HAS_EVENTS`), and so does a frame
+//! rate at or below the one it opened at, as that bitrate scaled by the two; a quality or VBV
+//! change, or a higher frame rate, re-opens it, as any rate change does on an earlier release.
 //!
 //! A constant-rate session on such a release names its references: it predicts every frame
 //! from the one before in a flat structure and has the library store anchors on the schedule
