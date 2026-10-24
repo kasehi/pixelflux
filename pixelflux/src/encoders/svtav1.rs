@@ -653,6 +653,47 @@ mod tests {
         }
     }
 
+    /// A frame rate at or below the one a constant-rate session opened at reaches the running
+    /// encoder with the next picture, so neither the drop to 30 nor the return to 60 starts the
+    /// picture again from a key frame; a rate above it reopens.
+    #[test]
+    fn a_frame_rate_change_keeps_the_session() {
+        use crate::encoders::codec::FRAME_KEY;
+        if !HAS_EVENTS {
+            return;
+        }
+        let at = |fps: f64| RustCaptureSettings {
+            width: 64,
+            height: 64,
+            target_fps: fps,
+            codec: Codec::Av1,
+            video_cbr_mode: true,
+            video_bitrate_kbps: 2000,
+            ..Default::default()
+        };
+        let frame = vec![0x40u8; 64 * 64 * 4];
+        let mut n = 0;
+        let mut key_after = |enc: &mut SvtAv1Encoder| loop {
+            let out = enc
+                .encode_host(&frame, 64 * 4, false, n, 30, n == 0)
+                .expect("frame");
+            n += 1;
+            if !out.is_empty() {
+                return out[1] & 0x0f == FRAME_KEY;
+            }
+        };
+        let mut enc = SvtAv1Encoder::new(&at(60.0), false).expect("session");
+        for _ in 0..4 {
+            key_after(&mut enc);
+        }
+        enc.reconfigure_rate(&at(30.0)).expect("30 fps");
+        assert!(!key_after(&mut enc), "after 30");
+        enc.reconfigure_rate(&at(60.0)).expect("60 fps");
+        assert!(!key_after(&mut enc), "after 60");
+        enc.reconfigure_rate(&at(120.0)).expect("120 fps");
+        assert!(key_after(&mut enc), "above the rate it opened at");
+    }
+
     /// A constant-rate session that manages its presets opens at `KEY_PRESET` with the
     /// screen-content mode on, codes a still screen's held key frame there, and every other
     /// frame, its first key frame included, at its own.
