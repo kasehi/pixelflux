@@ -27,6 +27,7 @@ use super::codec::{
     Codec, FRAME_ANCHOR, VIDEO_HEADER_LEN, VPX_QINDEX, av1_is_key, frame_type_from_key,
     push_video_header, vpx_level,
 };
+use super::frame_rate::FrameRate;
 use super::reference::{Reference, ReferenceSlots, SlotPlan, SlotRefresh};
 use super::session::{Pending, Planes, Quality, RateSettings, encode_threads};
 use crate::RustCaptureSettings;
@@ -93,6 +94,9 @@ pub struct SvtAv1Encoder {
     threads: i32,
     quality: Quality,
     rate: RateSettings,
+    /// The rate the encoder was opened at, which the library budgets each frame by; a live rate
+    /// at or below it reaches the running encoder as a target scaled by the two (`coded_bps`).
+    coded_fps: FrameRate,
     omit_headers: bool,
     fresh: bool,
     /// The change the next picture carries to the running encoder.
@@ -154,6 +158,7 @@ impl SvtAv1Encoder {
             threads: encode_threads(settings),
             quality: Quality::new(Codec::Av1.quantizer(settings.video_crf)),
             rate: RateSettings::new(settings),
+            coded_fps: RateSettings::new(settings).fps,
             omit_headers: settings.omit_stripe_headers,
             fresh: true,
             events: Events::default(),
@@ -206,6 +211,7 @@ impl SvtAv1Encoder {
             cfg.source_height = self.planes.height as u32;
             cfg.frame_rate_numerator = rate.fps.num;
             cfg.frame_rate_denominator = rate.fps.den;
+            self.coded_fps = rate.fps;
             cfg.encoder_bit_depth = self.planes.bit_depth;
             cfg.encoder_color_format = EB_YUV420;
             cfg.color_primaries = EB_CICP_CP_BT_709;
@@ -394,22 +400,31 @@ impl SvtAv1Encoder {
     }
 
     /// Apply a rate or frame-rate change: a new bitrate with the next picture where the library
-    /// takes one live, since the VBV it holds spans the same time at any bitrate; anything else
-    /// re-opens the encoder.
+    /// takes one live, since the VBV it holds spans the same time at any bitrate, and a frame
+    /// rate at or below `coded_fps` as that bitrate scaled by the two, since the library budgets
+    /// each frame `target / fps` at the rate it opened at and takes no new one (a constant
+    /// quantizer needs nothing told); anything else re-opens the encoder.
     pub fn reconfigure_rate(&mut self, settings: &RustCaptureSettings) -> Result<(), String> {
         let Some(rate) = self.rate.changed(settings) else {
             return Ok(());
         };
+        let previous = std::mem::replace(&mut self.rate, rate);
         let live = HAS_EVENTS
-            && rate.fps == self.rate.fps
-            && rate.vbv_multiplier == self.rate.vbv_multiplier
-            && rate.bps() <= MAX_BITRATE_BPS;
-        self.rate = rate;
+            && rate.fps.fps() <= self.coded_fps.fps()
+            && rate.vbv_multiplier == previous.vbv_multiplier
+            && self.coded_bps() <= MAX_BITRATE_BPS as f64;
         if !live {
             return self.open();
         }
-        self.events.target_bit_rate = rate.bps() as u32;
+        if rate.cbr {
+            self.events.target_bit_rate = self.coded_bps() as u32;
+        }
         Ok(())
+    }
+
+    /// The live bitrate as the library reads it at `coded_fps`.
+    fn coded_bps(&self) -> f64 {
+        self.rate.bps() as f64 * self.coded_fps.fps() / self.rate.fps.fps()
     }
 
     /// Encode one packed host frame at the quality index `crf`, as a key frame when `force_idr`.
@@ -512,7 +527,7 @@ impl SvtAv1Encoder {
                     1.0
                 };
                 self.events.target_bit_rate =
-                    (self.rate.bps() as f64 * factor.max(1.0)).min(MAX_BITRATE_BPS as f64) as u32;
+                    (self.coded_bps() * factor.max(1.0)).min(MAX_BITRATE_BPS as f64) as u32;
             }
             self.restate_target = held_key;
         }
@@ -692,6 +707,67 @@ mod tests {
         assert!(!key_after(&mut enc), "after 60");
         enc.reconfigure_rate(&at(120.0)).expect("120 fps");
         assert!(key_after(&mut enc), "above the rate it opened at");
+    }
+
+    /// A frame rate a running session takes keeps the bitrate per second: on noise the rate
+    /// control cannot undershoot, each frame at 30 spends about twice what one at 60 did, and
+    /// one back at 60 what it did before.
+    #[test]
+    fn a_frame_rate_change_keeps_the_bitrate() {
+        if !HAS_EVENTS {
+            return;
+        }
+        const W: usize = 320;
+        const H: usize = 240;
+        let at = |fps: f64| RustCaptureSettings {
+            width: W as i32,
+            height: H as i32,
+            target_fps: fps,
+            codec: Codec::Av1,
+            video_cbr_mode: true,
+            video_bitrate_kbps: 2000,
+            ..Default::default()
+        };
+        let noise = |t: u64| -> Vec<u8> {
+            let mut s = (t as u32).wrapping_mul(2654435761).wrapping_add(1);
+            (0..W * H * 4)
+                .map(|_| {
+                    s ^= s << 13;
+                    s ^= s >> 17;
+                    s ^= s << 5;
+                    (s >> 24) as u8
+                })
+                .collect()
+        };
+        let mut t = 0u64;
+        let mut per_frame = |enc: &mut SvtAv1Encoder| {
+            let mut spent = 0;
+            for n in 0..60 {
+                let out = enc
+                    .encode_host(&noise(t), W * 4, false, t, 30, t == 0)
+                    .expect("frame");
+                t += 1;
+                if n >= 30 {
+                    spent += out.len();
+                }
+            }
+            spent as f64 / 30.0
+        };
+        let mut enc = SvtAv1Encoder::new(&at(60.0), false).expect("session");
+        let at_60 = per_frame(&mut enc);
+        enc.reconfigure_rate(&at(30.0)).expect("30 fps");
+        let at_30 = per_frame(&mut enc);
+        enc.reconfigure_rate(&at(60.0)).expect("60 fps");
+        let back = per_frame(&mut enc);
+        let (down, up) = (at_30 / at_60, back / at_60);
+        assert!(
+            (1.5..2.6).contains(&down),
+            "a frame at 30 spends {at_30:.0} B against {at_60:.0} B at 60 (ratio {down:.2})"
+        );
+        assert!(
+            (0.75..1.33).contains(&up),
+            "back at 60 a frame spends {back:.0} B against {at_60:.0} B before (ratio {up:.2})"
+        );
     }
 
     /// A constant-rate session that manages its presets opens at `KEY_PRESET` with the

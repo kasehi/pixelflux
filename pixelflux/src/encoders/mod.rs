@@ -2178,8 +2178,9 @@ mod software_tests {
             .unwrap_or_else(|e| panic!("decode: {e:?}"))
     }
 
-    /// Whether the session takes a new bitrate without a key frame: libvpx, and SVT-AV1 where the
-    /// release takes one with a picture. A new quantizer reaches libvpx alone live.
+    /// Whether the session takes a new bitrate, or a frame rate no higher than the one it opened
+    /// at, without a key frame: libvpx, and SVT-AV1 where the release takes one with a picture. A
+    /// new quantizer reaches libvpx alone live.
     fn takes_a_live_rate(enc: &FrameEncoder) -> bool {
         match enc.backend_name() {
             "libvpx" => true,
@@ -2631,7 +2632,7 @@ mod software_tests {
             let after = enc
                 .encode_host(&frame(3), W * 4, false, 3, 15, false)
                 .unwrap();
-            let kind = if enc.backend_name() == "libvpx" {
+            let kind = if takes_a_live_rate(&enc) {
                 FRAME_DELTA
             } else {
                 FRAME_KEY

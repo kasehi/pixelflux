@@ -394,8 +394,11 @@ pub struct H264EncoderWrapper {
     current_bitrate: i32,
     current_vbv: i32,
     current_fps: FrameRate,
-    /// Open-time parameters retained so a frame-rate change can reopen the session: x264's live
-    /// reconfigure cannot alter the frame rate, and CBR/VBV budgets are derived from it.
+    /// The rate the session was opened at. x264's live reconfigure cannot change it and its rate
+    /// control budgets every frame by it (`bitrate / fps`), so a live rate at or below it reaches
+    /// the running encoder as a bitrate and VBV rate scaled by the two (`coded_kbps`).
+    coded_fps: FrameRate,
+    /// Open-time parameters retained so a frame rate above `coded_fps` can reopen the session.
     threads: i32,
     min_qp: i32,
     max_qp: i32,
@@ -693,6 +696,7 @@ impl H264EncoderWrapper {
                     current_bitrate: bitrate_kbps.saturating_abs(),
                     current_vbv: vbv_kbit,
                     current_fps: frame_rate,
+                    coded_fps: frame_rate,
                     threads,
                     min_qp,
                     max_qp,
@@ -740,23 +744,29 @@ impl H264EncoderWrapper {
     /// before touching the encoder when neither the bitrate/VBV nor the frame rate differs from
     /// what is live — that self-gating keeps a per-frame call nearly free.
     ///
-    /// A frame-rate change reopens the encoder rather than reconfiguring it: `x264_encoder_reconfig`
-    /// does not apply `i_fps_*`, and the CBR/VBV per-frame budget is `bitrate / fps`, so a session
-    /// left at its old rate ships roughly half the configured bitrate once fps halves. The reopen
-    /// carries the new bitrate/VBV too, and a fresh session emits an IDR on its first frame; a failed
-    /// reopen keeps the working session instead of nulling the handle. Capping a CRF session or
-    /// lifting its cap reopens it too, since x264 retunes a VBV in place only while one is on. A
-    /// bitrate/VBV-only change otherwise stays a live `x264_encoder_reconfig`, and the tracked
-    /// mirror advances only on success so it cannot drift from the encoder's real state.
+    /// `x264_encoder_reconfig` does not apply `i_fps_*`, and the CBR/VBV per-frame budget is
+    /// `bitrate / fps`, so a rate at or below `coded_fps` reaches the running encoder as its
+    /// bitrate and VBV rate scaled by `coded_fps / fps`: each frame keeps the budget the live rate
+    /// gives it and the picture keeps its references, where a fresh session would start it again
+    /// from an IDR. The stream's declared timing stays the coded rate's. A rate above it reopens
+    /// the encoder, since the level and the decoded picture buffer were sized for the lower rate;
+    /// the reopen carries the new bitrate/VBV, a fresh session emits an IDR on its first frame, and
+    /// a failed reopen keeps the working session instead of nulling the handle. Capping a CRF
+    /// session or lifting its cap reopens it too, since x264 retunes a VBV in place only while one
+    /// is on. The tracked mirror advances only on success so it cannot drift from the encoder's
+    /// real state.
     pub fn reconfigure_rate(&mut self, bitrate_kbps: i32, vbv_kbit: i32, fps: f64) {
         let bk = bitrate_kbps.saturating_abs();
         let new_fps = x264_frame_rate(fps);
         let vbv_applies = self.is_cbr || vbv_kbit > 0;
-        let rate_changed =
-            vbv_applies && (self.current_bitrate != bk || self.current_vbv != vbv_kbit);
-        let reopen = self.current_fps != new_fps
+        let rate_changed = vbv_applies
+            && (self.current_bitrate != bk
+                || self.current_vbv != vbv_kbit
+                || self.current_fps != new_fps);
+        let reopen = new_fps.fps() > self.coded_fps.fps()
             || (!self.is_cbr && (self.current_vbv > 0) != (vbv_kbit > 0));
         if !rate_changed && !reopen {
+            self.current_fps = new_fps;
             return;
         }
         if reopen {
@@ -779,19 +789,28 @@ impl H264EncoderWrapper {
             }
             return;
         }
+        let coded = self.coded_kbps(bk, new_fps);
         unsafe {
             let mut param: x264_sys::x264_param_t = std::mem::zeroed();
             x264_sys::x264_encoder_parameters(self.encoder, &mut param);
-            param.rc.i_bitrate = bk;
+            param.rc.i_bitrate = coded;
             if vbv_applies {
-                param.rc.i_vbv_max_bitrate = bk;
+                param.rc.i_vbv_max_bitrate = coded;
                 param.rc.i_vbv_buffer_size = vbv_kbit.max(1);
             }
             if x264_sys::x264_encoder_reconfig(self.encoder, &mut param) == 0 {
                 self.current_bitrate = bk;
                 self.current_vbv = vbv_kbit;
+                self.current_fps = new_fps;
             }
         }
+    }
+
+    /// `kbps` at the live rate `fps` as the rate control reads it at `coded_fps`.
+    fn coded_kbps(&self, kbps: i32, fps: FrameRate) -> i32 {
+        (kbps as f64 * self.coded_fps.fps() / fps.fps())
+            .round()
+            .min(i32::MAX as f64) as i32
     }
 
     /// The frame the last encoded frame predicted from.
@@ -832,10 +851,10 @@ impl H264EncoderWrapper {
             self.current_crf,
             self.is_i444,
             self.bit_depth,
-            self.current_fps.fps(),
+            self.coded_fps.fps(),
             self.threads,
             self.is_cbr,
-            self.current_bitrate,
+            self.coded_kbps(self.current_bitrate, self.current_fps),
             self.current_vbv,
             self.min_qp,
             self.max_qp,
@@ -844,6 +863,8 @@ impl H264EncoderWrapper {
         );
         let Some(mut fresh) = fresh else { return false };
         fresh.held_qp = self.held_qp;
+        fresh.current_bitrate = self.current_bitrate;
+        fresh.current_fps = self.current_fps;
         *self = fresh;
         true
     }
@@ -853,8 +874,9 @@ impl H264EncoderWrapper {
         unsafe {
             let mut param: x264_sys::x264_param_t = std::mem::zeroed();
             x264_sys::x264_encoder_parameters(self.encoder, &mut param);
-            param.rc.i_bitrate = self.current_bitrate;
-            param.rc.i_vbv_max_bitrate = self.current_bitrate;
+            let coded = self.coded_kbps(self.current_bitrate, self.current_fps);
+            param.rc.i_bitrate = coded;
+            param.rc.i_vbv_max_bitrate = coded;
             param.rc.i_vbv_buffer_size = self.current_vbv.max(1);
             x264_sys::x264_encoder_reconfig(self.encoder, &mut param);
         }
@@ -4009,24 +4031,38 @@ mod qp_bound_sweep {
             ));
             (h264_frame_type(&out), enc.last_reference())
         };
-        let mut enc =
-            H264EncoderWrapper::new(W as i32, H as i32, 25, false, 60.0, 1, true, 4000, 100, 0, 0)
-                .expect("x264 init");
+        let mut enc = H264EncoderWrapper::new(
+            W as i32, H as i32, 25, false, 60.0, 1, true, 4000, 100, 0, 0,
+        )
+        .expect("x264 init");
         for i in 0..4 {
             encode(&mut enc, i);
         }
         enc.reconfigure_rate(4000, 200, 30.0);
-        assert_eq!(encode(&mut enc, 4), (FRAME_DELTA, Reference::Frame(3)), "after 30");
+        assert_eq!(
+            encode(&mut enc, 4),
+            (FRAME_DELTA, Reference::Frame(3)),
+            "after 30"
+        );
         enc.reconfigure_rate(4000, 100, 60.0);
-        assert_eq!(encode(&mut enc, 5), (FRAME_DELTA, Reference::Frame(4)), "after 60");
-        let mut enc =
-            H264EncoderWrapper::new(W as i32, H as i32, 25, false, 30.0, 1, true, 4000, 200, 0, 0)
-                .expect("x264 init");
+        assert_eq!(
+            encode(&mut enc, 5),
+            (FRAME_DELTA, Reference::Frame(4)),
+            "after 60"
+        );
+        let mut enc = H264EncoderWrapper::new(
+            W as i32, H as i32, 25, false, 30.0, 1, true, 4000, 200, 0, 0,
+        )
+        .expect("x264 init");
         for i in 0..4 {
             encode(&mut enc, i);
         }
         enc.reconfigure_rate(4000, 100, 60.0);
-        assert_eq!(encode(&mut enc, 4).0, FRAME_KEY, "above the rate it opened at");
+        assert_eq!(
+            encode(&mut enc, 4).0,
+            FRAME_KEY,
+            "above the rate it opened at"
+        );
     }
 
     /// A session told to keep one reference frame (`video_reference_frames`) declares a decoded
@@ -4364,7 +4400,7 @@ mod qp_bound_sweep {
     /// the per-second bitrate is preserved rather than collapsing to half, which is what the pre-fix
     /// path did by leaving the session budgeting for 60 fps (`x264_encoder_reconfig` never applies a
     /// frame-rate change). Single-threaded so the rate-control measurement is deterministic; warmup
-    /// frames are discarded so the ABR controller and the post-reopen IDR do not skew the mean.
+    /// frames are discarded so the ABR controller and the key frame each phase starts with do not skew the mean.
     #[cfg(feature = "gpl")]
     #[test]
     fn cbr_bitrate_tracks_configured_rate_after_fps_change() {
